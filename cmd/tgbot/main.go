@@ -295,7 +295,7 @@ func (b *Bot) handleSingle(ctx context.Context, message *TelegramMessage, entry 
 	status := b.sendMessage(ctx, message.Chat.ID, "🔍 处理："+entry)
 	magnet, err := b.resolveEntry(ctx, entry)
 	if err != nil { b.editMessage(ctx, message.Chat.ID, status, "❌ "+err.Error()); return }
-	result, err := b.addOfflineDownload(ctx, []string{magnet})
+	_, err = b.addOfflineDownload(ctx, []string{magnet})
 	if err != nil { b.editMessage(ctx, message.Chat.ID, status, "❌ "+err.Error()); return }
 	b.editMessage(ctx, message.Chat.ID, status, "✅ 已添加到下载队列")
 	if b.notifyEnabled(message.From.ID, true) { b.sendMessage(ctx, message.Chat.ID, "✅ 任务完成："+entry) }
