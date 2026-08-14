@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -138,6 +139,9 @@ type SearchEntry struct {
 }
 
 func main() {
+	if envFile := loadDotEnv(); envFile != "" {
+		log.Printf("loaded environment file: %s", envFile)
+	}
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatal(err)
@@ -153,6 +157,69 @@ func main() {
 	log.Printf("tgbot Go service started; directories=%d proxy=%t", len(cfg.OfflineDirs), cfg.ProxyURL != "")
 	go bot.cleanLoop(context.Background())
 	bot.poll(context.Background())
+}
+
+func loadDotEnv() string {
+	candidates := make([]string, 0, 5)
+	if configured := strings.TrimSpace(os.Getenv("TGBOT_ENV_FILE")); configured != "" {
+		candidates = append(candidates, configured)
+	}
+	if workingDirectory, err := os.Getwd(); err == nil {
+		candidates = append(candidates,
+			filepath.Join(workingDirectory, ".env"),
+			filepath.Join(workingDirectory, ".env.go"),
+			filepath.Join(workingDirectory, "tgbot.env"),
+		)
+	}
+	if executable, err := os.Executable(); err == nil {
+		executableDirectory := filepath.Dir(executable)
+		candidates = append(candidates, filepath.Join(executableDirectory, ".env"))
+	}
+	candidates = append(candidates, "/etc/tgbot/tgbot.env")
+
+	seen := make(map[string]bool)
+	for _, candidate := range candidates {
+		candidate = filepath.Clean(candidate)
+		if seen[candidate] { continue }
+		seen[candidate] = true
+		if _, err := os.Stat(candidate); err != nil { continue }
+		if err := parseDotEnvFile(candidate); err != nil {
+			log.Printf("environment file warning (%s): %v", candidate, err)
+			continue
+		}
+		return candidate
+	}
+	return ""
+}
+
+func parseDotEnvFile(filename string) error {
+	file, err := os.Open(filename)
+	if err != nil { return err }
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(strings.TrimPrefix(scanner.Text(), "\ufeff"))
+		if line == "" || strings.HasPrefix(line, "#") { continue }
+		line = strings.TrimPrefix(line, "export ")
+		separator := strings.IndexByte(line, '=')
+		if separator <= 0 { continue }
+		key := strings.TrimSpace(line[:separator])
+		value := strings.TrimSpace(line[separator+1:])
+		if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(key) {
+			log.Printf("environment file warning (%s:%d): invalid variable name %q", filename, lineNumber, key)
+			continue
+		}
+		if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'')) {
+			value = value[1 : len(value)-1]
+		}
+		if _, exists := os.LookupEnv(key); !exists {
+			if err := os.Setenv(key, value); err != nil { return err }
+		}
+	}
+	return scanner.Err()
 }
 
 func loadConfig() (Config, error) {

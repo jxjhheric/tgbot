@@ -52,7 +52,7 @@ Worker 环境的出站请求由 Cloudflare `fetch` 发起，Python 版本的 `PR
 
 ## Go + VPS + systemd
 
-`go-vps-systemd` 分支包含 Go 版本，使用 Telegram 长轮询，支持代理、Alist、搜索、下载、清理、分类、目录切换和定时任务。配置模板见 `.env.go.example`。
+`go-vps-systemd` 分支包含 Go 版本，使用 Telegram 长轮询，支持代理、Alist、搜索、下载、清理、分类、目录切换和定时任务。配置模板见 `.env.go.example`。Go 版本会自动读取当前目录的 `.env`，也支持通过 `TGBOT_ENV_FILE` 指定配置文件。
 
 在 VPS 上编译运行：
 
@@ -74,3 +74,13 @@ sudo systemctl status tgbot
 首次编译前执行 `go mod tidy` 生成依赖校验文件，再执行上面的 `go build`。
 
 编辑 `/etc/tgbot/tgbot.env` 后执行 `sudo systemctl restart tgbot`。日志使用 `journalctl -u tgbot -f` 查看。`PROXY_URL` 支持 HTTP/HTTPS 和 SOCKS5，例如 `socks5://127.0.0.1:7891`。
+
+直接运行二进制时，可以这样配置：
+
+```bash
+cp .env.go.example .env
+chmod 600 .env
+./tgbot
+```
+
+已有系统环境变量不会被 `.env` 覆盖；systemd 模式优先使用 `/etc/tgbot/tgbot.env`。
