@@ -1,6 +1,0 @@
-python-telegram-bot[job-queue]
-loguru
-python-dotenv
-aiohttp
-beautifulsoup4
-tenacity
