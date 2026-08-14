@@ -26,3 +26,13 @@ jobs:
 
       - name: Build Linux binary
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o tgbot ./cmd/tgbot
+
+      - name: Upload Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tgbot-linux-amd64
+          path: |
+            tgbot
+            .env.go.example
+            deploy/systemd/tgbot.service
+          retention-days: 30
