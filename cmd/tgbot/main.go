@@ -69,9 +69,12 @@ type Bot struct {
 	client     *http.Client
 	state      State
 	stateMu    sync.Mutex
+	cfgMu      sync.RWMutex
 	updateMu   sync.Mutex
 	offset     int64
 	cleanMu    sync.Mutex
+	cleanWake  chan struct{}
+	apiSem     chan struct{}
 }
 
 type TelegramUpdate struct {
@@ -143,7 +146,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	bot := &Bot{cfg: cfg, client: client}
+	bot := &Bot{cfg: cfg, client: client, cleanWake: make(chan struct{}, 1), apiSem: make(chan struct{}, cfg.MaxConcurrent)}
 	if err := bot.loadState(); err != nil {
 		log.Printf("state load warning: %v", err)
 	}
@@ -299,6 +302,8 @@ func (b *Bot) handleSingle(ctx context.Context, message *TelegramMessage, entry 
 	if err != nil { b.editMessage(ctx, message.Chat.ID, status, "❌ "+err.Error()); return }
 	b.editMessage(ctx, message.Chat.ID, status, "✅ 已添加到下载队列")
 	if b.notifyEnabled(message.From.ID, true) { b.sendMessage(ctx, message.Chat.ID, "✅ 任务完成："+entry) }
+	time.Sleep(3 * time.Second)
+	b.refreshDirectory(ctx, message.Chat.ID, b.currentDirectory())
 }
 
 func (b *Bot) handleBatch(ctx context.Context, message *TelegramMessage, entries []string) {
@@ -317,6 +322,10 @@ func (b *Bot) handleBatch(ctx context.Context, message *TelegramMessage, entries
 		if b.notifyEnabled(message.From.ID, true) { b.sendMessage(ctx, message.Chat.ID, "✅ 任务完成："+entry) }
 	}
 	b.editMessage(ctx, message.Chat.ID, status, fmt.Sprintf("✅ 完成（成功: %d/%d）\n%s", success, len(entries), strings.Join(limitStrings(results, 10), "\n")))
+	if success > 0 {
+		time.Sleep(3 * time.Second)
+		b.refreshDirectory(ctx, message.Chat.ID, b.currentDirectory())
+	}
 }
 
 func (b *Bot) resolveEntry(ctx context.Context, entry string) (string, error) {
@@ -342,19 +351,28 @@ func (b *Bot) searchMagnet(ctx context.Context, code string) (string, error) {
 
 func (b *Bot) fetchSearchAPI(ctx context.Context, base, code string) []SearchEntry {
 	var body struct { Status string `json:"status"`; Data []interface{} `json:"data"` }
-	if err := b.requestJSON(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/"+url.PathEscape(code), nil, &body, 20*time.Second); err != nil || body.Status != "succeed" { return nil }
+	if err := b.requestJSONRetry(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/"+url.PathEscape(code), nil, &body, 20*time.Second, 3); err != nil || body.Status != "succeed" { return nil }
 	entries := make([]SearchEntry, 0)
 	for _, raw := range body.Data { if entry, ok := parseSearchValue(raw); ok && isFanhaoMatch(code, entry.Name) { entries = append(entries, entry) } }
 	return entries
 }
 
 func (b *Bot) scrapeSukebei(ctx context.Context, code string) []SearchEntry {
-	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://sukebei.nyaa.si/?f=0&c=0_0&q="+url.QueryEscape(code), nil)
-	request.Header.Set("User-Agent", "tgbot-go/1.0")
-	response, err := b.client.Do(request)
-	if err != nil { return nil }
-	defer response.Body.Close()
-	data, err := io.ReadAll(response.Body); if err != nil { return nil }
+	var data []byte
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		request, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, "https://sukebei.nyaa.si/?f=0&c=0_0&q="+url.QueryEscape(code), nil)
+		if requestErr != nil { return nil }
+		request.Header.Set("User-Agent", "tgbot-go/1.0")
+		response, requestErr := b.do(request)
+		if requestErr == nil {
+			data, err = io.ReadAll(response.Body)
+			response.Body.Close()
+			if err == nil && response.StatusCode >= 200 && response.StatusCode < 300 { break }
+		}
+		if attempt < 2 { time.Sleep(time.Duration(1<<attempt) * time.Second) }
+	}
+	if err != nil || len(data) == 0 { return nil }
 	rows := regexp.MustCompile(`(?is)<tr[^>]*class=["'][^"']*(?:default|success)[^"']*["'][^>]*>(.*?)</tr>`).FindAllSubmatch(data, -1)
 	result := make([]SearchEntry, 0, len(rows))
 	for _, row := range rows {
@@ -362,12 +380,23 @@ func (b *Bot) scrapeSukebei(ctx context.Context, code string) []SearchEntry {
 		name := stripTags(firstMatch(content, `(?is)<td[^>]*>\s*<a[^>]*>(.*?)</a>`))
 		magnet := firstMatch(content, `(?is)href=["'](magnet:\?[^"']+)`)
 		if magnet == "" || !isFanhaoMatch(code, html.UnescapeString(name)) { continue }
-		result = append(result, SearchEntry{Magnet: html.UnescapeString(magnet), Name: strings.TrimSpace(html.UnescapeString(name)), Source: "sukebei"})
+		cells := regexp.MustCompile(`(?is)<td[^>]*>(.*?)</td>`).FindAllStringSubmatch(content, -1)
+		entry := SearchEntry{Magnet: html.UnescapeString(magnet), Name: strings.TrimSpace(html.UnescapeString(name)), Source: "sukebei"}
+		if len(cells) > 2 { entry.Size = parseSize(stripTags(cells[2][1])) }
+		if len(cells) > 4 { entry.Date = parseDate(stripTags(cells[4][1])) }
+		result = append(result, entry)
 	}
 	return result
 }
 
 func parseSearchValue(raw interface{}) (SearchEntry, bool) {
+	if values, ok := raw.([]interface{}); ok && len(values) >= 4 {
+		magnet, _ := values[0].(string)
+		name, _ := values[1].(string)
+		size, _ := values[2].(string)
+		date, _ := values[3].(string)
+		if strings.HasPrefix(magnet, "magnet:?") { return SearchEntry{Magnet: magnet, Name: name, Size: parseSize(size), Date: parseDate(date), Source: "api"}, true }
+	}
 	s, ok := raw.(string); if !ok { return SearchEntry{}, false }
 	parts := regexp.MustCompile(`^\s*\[\s*["'](magnet:\?[^"']+)["']\s*,\s*["'](.*?)["']\s*,\s*["'](.*?)["']\s*,\s*["'](.*?)["']\s*\]\s*$`).FindStringSubmatch(s)
 	if len(parts) != 5 { return SearchEntry{}, false }
@@ -390,9 +419,12 @@ func (b *Bot) addOfflineDownload(ctx context.Context, links []string) (bool, err
 
 func (b *Bot) alist(ctx context.Context, endpoint string, payload interface{}) (alistResponse, error) {
 	var result alistResponse
-	err := b.requestJSON(ctx, http.MethodPost, b.cfg.AlistBaseURL+endpoint, payload, &result, 30*time.Second)
+	err := b.requestJSONRetry(ctx, http.MethodPost, b.cfg.AlistBaseURL+endpoint, payload, &result, 30*time.Second, 3)
 	if err != nil { return result, err }
-	if result.Code != 200 { return result, fmt.Errorf("alist: %s", result.Message) }
+	if result.Code != 200 {
+		if result.Code == http.StatusTooManyRequests { return result, &httpStatusError{StatusCode: result.Code, Message: result.Message} }
+		return result, fmt.Errorf("alist: %s", result.Message)
+	}
 	return result, nil
 }
 
@@ -408,13 +440,27 @@ func (b *Bot) requestJSON(ctx context.Context, method, endpoint string, payload 
 	request.Header.Set("User-Agent", "tgbot-go/1.0")
 	if payload != nil { request.Header.Set("Content-Type", "application/json") }
 	if strings.Contains(endpoint, b.cfg.AlistBaseURL) { request.Header.Set("Authorization", b.cfg.AlistToken) }
-	response, err := b.client.Do(request); if err != nil { return err }
+	response, err := b.do(request); if err != nil { return err }
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
 		return &httpStatusError{StatusCode: response.StatusCode, Message: strings.TrimSpace(string(data))}
 	}
 	return json.NewDecoder(response.Body).Decode(target)
+}
+
+func (b *Bot) requestJSONRetry(ctx context.Context, method, endpoint string, payload interface{}, target interface{}, timeout time.Duration, attempts int) error {
+	var last error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if err := b.requestJSON(ctx, method, endpoint, payload, target, timeout); err == nil { return nil } else { last = err }
+		if attempt+1 < attempts { time.Sleep(time.Duration(1<<attempt) * time.Second) }
+	}
+	return last
+}
+
+func (b *Bot) do(request *http.Request) (*http.Response, error) {
+	if b.apiSem != nil { b.apiSem <- struct{}{}; defer func() { <-b.apiSem }() }
+	return b.client.Do(request)
 }
 
 func (b *Bot) telegramRequest(ctx context.Context, method string, payload interface{}, target interface{}, timeout time.Duration) error {
@@ -506,9 +552,18 @@ func (b *Bot) setDir(ctx context.Context, message *TelegramMessage) {
 }
 
 func (b *Bot) refresh(ctx context.Context, message *TelegramMessage) {
-	_, err := b.alist(ctx, "/api/fs/list", map[string]interface{}{"path": b.currentDirectory(), "page": 1, "per_page": 0, "refresh": true})
-	if err != nil { b.sendMessage(ctx, message.Chat.ID, "❌ 刷新失败: "+err.Error()); return }
-	b.sendMessage(ctx, message.Chat.ID, "✅ Alist 刷新成功！")
+	b.refreshDirectory(ctx, message.Chat.ID, b.currentDirectory())
+}
+
+func (b *Bot) refreshDirectory(ctx context.Context, chatID int64, directory string) bool {
+	status := b.sendMessage(ctx, chatID, "🔄 正在刷新 Alist 文件列表...")
+	_, err := b.alist(ctx, "/api/fs/list", map[string]interface{}{"path": directory, "page": 1, "per_page": 0, "refresh": true})
+	if err != nil {
+		b.editMessage(ctx, chatID, status, "❌ 刷新失败: "+err.Error())
+		return false
+	}
+	b.editMessage(ctx, chatID, status, "✅ Alist 刷新成功！")
+	return true
 }
 
 func (b *Bot) notify(ctx context.Context, message *TelegramMessage, args []string) {
@@ -530,8 +585,11 @@ func (b *Bot) reloadConfig(ctx context.Context, message *TelegramMessage) {
 	if err != nil { b.sendMessage(ctx, message.Chat.ID, "❌ 配置重载失败: "+err.Error()); return }
 	newClient, err := newHTTPClient(newConfig.ProxyURL)
 	if err != nil { b.sendMessage(ctx, message.Chat.ID, "❌ 代理配置无效: "+err.Error()); return }
+	b.cfgMu.Lock()
 	b.cfg = newConfig
 	b.client = newClient
+	b.apiSem = make(chan struct{}, newConfig.MaxConcurrent)
+	b.cfgMu.Unlock()
 	b.stateMu.Lock()
 	if b.state.CurrentDirectory == "" || !contains(newConfig.OfflineDirs, b.state.CurrentDirectory) {
 		b.state.CurrentIndex = 0
@@ -539,6 +597,7 @@ func (b *Bot) reloadConfig(ctx context.Context, message *TelegramMessage) {
 	}
 	b.stateMu.Unlock()
 	_ = b.saveState()
+	select { case b.cleanWake <- struct{}{}: default: }
 	b.sendMessage(ctx, message.Chat.ID, fmt.Sprintf("✅ 配置已热重载\n• 当前目录：%s\n• 清理间隔：%s\n• 大小阈值：%d MB\n• 下载目录数：%d\n• 搜索API数：%d\n• 允许用户数：%d", b.currentDirectory(), newConfig.CleanInterval, newConfig.SizeThreshold/1024/1024, len(newConfig.OfflineDirs), len(newConfig.SearchURLs), len(newConfig.AllowedUsers)))
 }
 
@@ -552,8 +611,10 @@ func (b *Bot) classify(ctx context.Context, message *TelegramMessage, args []str
 	for _, targetDirectory := range targets {
 		movedCount, failedCount := b.classifyDirectory(ctx, targetDirectory, classifyType)
 		moved += movedCount; failed += failedCount
+		b.editMessage(ctx, message.Chat.ID, status, fmt.Sprintf("🔄 批量整理中...\n• 已处理目录: %d/%d\n• 已移动: %d\n• 失败: %d", movedCount, len(targets), moved, failed))
 	}
 	b.editMessage(ctx, message.Chat.ID, status, fmt.Sprintf("✅ 整理完成！\n• 处理目录: %d\n• 移动项目: %d\n• 失败项目: %d", len(targets), moved, failed))
+	b.refreshDirectory(ctx, message.Chat.ID, base)
 }
 
 func parseClassifyArgs(args []string) (string, string) {
@@ -686,10 +747,12 @@ func (b *Bot) cleanCommand(ctx context.Context, message *TelegramMessage, args [
 	deletedFiles, deletedDirs := 0, 0
 	for _, target := range targets {
 		deletedFiles += b.cleanSmallFiles(ctx, target)
+		b.editMessage(ctx, message.Chat.ID, status, fmt.Sprintf("🧹 清理中...\n• 已处理目录: %s\n• 删除小文件: %d\n• 删除空目录: %d", target, deletedFiles, deletedDirs))
 		deletedDirs += b.cleanEmptyDirectories(ctx, target)
+		b.editMessage(ctx, message.Chat.ID, status, fmt.Sprintf("🧹 清理中...\n• 已处理目录: %s\n• 删除小文件: %d\n• 删除空目录: %d", target, deletedFiles, deletedDirs))
 	}
 	b.editMessage(ctx, message.Chat.ID, status, fmt.Sprintf("✅ 清理完成\n• 删除小文件: %d\n• 删除空目录: %d", deletedFiles, deletedDirs))
-	if b.notifyEnabled(message.From.ID, false) { b.sendMessage(ctx, message.Chat.ID, fmt.Sprintf("✅ 清理任务完成：删除小文件 %d 个，空目录 %d 个", deletedFiles, deletedDirs)) }
+	b.refreshDirectory(ctx, message.Chat.ID, current)
 }
 
 func (b *Bot) cleanSmallFiles(ctx context.Context, root string) int {
@@ -751,17 +814,81 @@ func (b *Bot) removeWithRetry(ctx context.Context, directory string, names []str
 }
 
 func (b *Bot) cleanLoop(ctx context.Context) {
-	if b.cfg.SizeThreshold <= 0 { return }
-	ticker := time.NewTicker(b.cfg.CleanInterval); defer ticker.Stop()
-	for range ticker.C {
-		b.cleanMu.Lock()
-		for _, directory := range b.cfg.OfflineDirs {
-			files := b.cleanSmallFiles(ctx, directory)
-			dirs := b.cleanEmptyDirectories(ctx, directory)
-			log.Printf("scheduled cleanup %s: files=%d dirs=%d", directory, files, dirs)
-		}
-		b.cleanMu.Unlock()
+	var ticker *time.Ticker
+	var tick <-chan time.Time
+	resetTicker := func() {
+		if ticker != nil { ticker.Stop() }
+		b.cfgMu.RLock()
+		interval := b.cfg.CleanInterval
+		enabled := b.cfg.SizeThreshold > 0
+		b.cfgMu.RUnlock()
+		if enabled { ticker = time.NewTicker(interval); tick = ticker.C } else { ticker = nil; tick = nil }
 	}
+	resetTicker()
+	for {
+		select {
+		case <-ctx.Done():
+			if ticker != nil { ticker.Stop() }
+			return
+		case <-b.cleanWake:
+			resetTicker()
+		case <-tick:
+			b.runScheduledCleanup(ctx)
+		}
+	}
+}
+
+func (b *Bot) runScheduledCleanup(ctx context.Context) {
+	b.cleanMu.Lock()
+	defer b.cleanMu.Unlock()
+	b.cfgMu.RLock()
+	directories := append([]string(nil), b.cfg.OfflineDirs...)
+	users := make([]int64, 0, len(b.cfg.AllowedUsers))
+	for userID := range b.cfg.AllowedUsers { users = append(users, userID) }
+	b.cfgMu.RUnlock()
+	directories = topLevelDirectories(directories)
+	start := fmt.Sprintf("🔄 自动清理任务启动\n• 时间: %s", time.Now().Format("2006-01-02 15:04:05"))
+	for _, userID := range users {
+		if b.notifyEnabled(userID, false) { b.sendMessage(ctx, userID, start); time.Sleep(300 * time.Millisecond) }
+	}
+	results := make([]string, 0, len(directories)+2)
+	for _, directory := range directories {
+		files := b.cleanSmallFiles(ctx, directory)
+		dirs := b.cleanEmptyDirectories(ctx, directory)
+		results = append(results, fmt.Sprintf("📂 目录 %s:\n• 小文件: 成功清理 %d 个\n• 空目录: 成功删除 %d 个", directory, files, dirs))
+		log.Printf("scheduled cleanup %s: files=%d dirs=%d", directory, files, dirs)
+		time.Sleep(time.Second)
+	}
+	summary := "✅ 自动清理完成\n• 时间: " + time.Now().Format("2006-01-02 15:04:05") + "\n" + strings.Join(results, "\n")
+	for _, userID := range users {
+		if !b.notifyEnabled(userID, false) { continue }
+		for _, part := range splitMessage(summary, 4000) { b.sendMessage(ctx, userID, part); time.Sleep(300 * time.Millisecond) }
+	}
+}
+
+func topLevelDirectories(directories []string) []string {
+	sort.Slice(directories, func(i, j int) bool { return len(directories[i]) < len(directories[j]) })
+	result := make([]string, 0, len(directories))
+	for _, directory := range directories {
+		directory = normalizePath(directory)
+		parentFound := false
+		for _, parent := range result { if directory == parent || strings.HasPrefix(directory, parent+"/") { parentFound = true; break } }
+		if !parentFound { result = append(result, directory) }
+	}
+	return result
+}
+
+func splitMessage(value string, max int) []string {
+	if len(value) <= max { return []string{value} }
+	parts := make([]string, 0)
+	current := ""
+	for _, line := range strings.Split(value, "\n") {
+		if current != "" && len(current)+len(line)+1 > max { parts = append(parts, current); current = "" }
+		if current != "" { current += "\n" }
+		current += line
+	}
+	if current != "" { parts = append(parts, current) }
+	return parts
 }
 
 func stringValue(value interface{}) string { result, _ := value.(string); return result }
