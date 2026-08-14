@@ -1,0 +1,5 @@
+*.exe
+*.zip
+/go/
+/tgbot
+*.tmp

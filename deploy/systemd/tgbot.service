@@ -1,0 +1,22 @@
+[Unit]
+Description=tgbot Go Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tgbot
+Group=tgbot
+WorkingDirectory=/opt/tgbot
+EnvironmentFile=/etc/tgbot/tgbot.env
+ExecStart=/opt/tgbot/tgbot
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tgbot
+
+[Install]
+WantedBy=multi-user.target

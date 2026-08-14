@@ -1,0 +1,12 @@
+name = "tgbot-worker"
+main = "src/index.js"
+compatibility_date = "2026-08-14"
+
+[triggers]
+crons = ["0 * * * *"]
+
+# Optional: create a KV namespace with `npx wrangler kv namespace create STATE`
+# and uncomment the following block, replacing the id.
+# [[kv_namespaces]]
+# binding = "STATE"
+# id = "your-kv-namespace-id"
