@@ -37,6 +37,7 @@ class Config:
         """加载或重新加载配置"""
         load_dotenv(override=True)
         self.TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+        self.PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
         self.BASE_URL = os.getenv("ALIST_BASE_URL", "")
         self.ALIST_TOKEN = os.getenv("ALIST_TOKEN", "")
         self.ALIST_OFFLINE_DIRS = [d.strip() for d in os.getenv("ALIST_OFFLINE_DIRS", "").split(",") if d.strip()]
@@ -149,6 +150,26 @@ class Config:
 config = Config()
 if not config.validate():
     sys.exit(1)
+
+
+class ProxiedClientSession:
+    """ClientSession wrapper that applies the configured HTTP proxy."""
+
+    def __init__(self, *args, **kwargs):
+        self._session = aiohttp.ClientSession(*args, **kwargs)
+
+    async def __aenter__(self):
+        await self._session.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return await self._session.__aexit__(exc_type, exc_value, traceback)
+
+    def get(self, url, *args, **kwargs):
+        return self._session.get(url, *args, proxy=config.PROXY_URL, **kwargs)
+
+    def post(self, url, *args, **kwargs):
+        return self._session.post(url, *args, proxy=config.PROXY_URL, **kwargs)
 
 # 配置 Loguru 日志
 logger.remove()
@@ -376,7 +397,7 @@ async def search_magnet(fanhao: str, search_urls: List[str], context: ContextTyp
     if not FANHAO_REGEX.match(fanhao):
         return None, f"❌ 无效番号格式: {fanhao}"
     
-    async with aiohttp.ClientSession() as session:
+    async with ProxiedClientSession() as session:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
@@ -472,7 +493,7 @@ async def add_offline_download(context: ContextTypes.DEFAULT_TYPE, token: str, l
             "tool": "storage",
             "delete_policy": "delete_on_upload_succeed"
         }
-        async with aiohttp.ClientSession() as session:
+        async with ProxiedClientSession() as session:
             async with session.post(url, json=post_data, headers=headers, timeout=30) as response:
                 status = response.status
                 result = await response.json()
@@ -525,7 +546,7 @@ async def recursive_collect_files(token: str, base_url: str, root_dir: str) -> T
         except aiohttp.ClientError as e:
             logger.error(f"列出目录 {dir_path} 失败: {str(e)}")
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with ProxiedClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         await collect_files_worker(root_dir, session)
     return dict(dir_files), known_empty_dirs
 
@@ -560,7 +581,7 @@ async def recursive_collect_empty_dirs(token: str, base_url: str, root_dir: str)
         except aiohttp.ClientError as e:
             logger.error(f"列出目录 {dir_path} 失败: {str(e)}")
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with ProxiedClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         await check_dir(root_dir, session)
     return list(empty_dirs)
 
@@ -571,7 +592,7 @@ async def cleanup_small_files(token: str, base_url: str, root_dir: str, progress
     headers = {"Authorization": token}
     payload = {"path": root_dir, "page": 1, "per_page": 0}
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        async with ProxiedClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             async with session.post(list_url, json=payload, headers=headers) as resp:
                 if resp.status != 200:
                     return 0, f"❌ 无法访问路径 {root_dir}: 状态码 {resp.status}"
@@ -604,7 +625,7 @@ async def cleanup_small_files(token: str, base_url: str, root_dir: str, progress
 
     deleted_count = 0
     errors = []
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=config.MAX_CONCURRENT_REQUESTS)) as session:
+    async with ProxiedClientSession(connector=aiohttp.TCPConnector(limit=config.MAX_CONCURRENT_REQUESTS)) as session:
         for batch_idx, batch in enumerate(merged_batches, 1):
             batch_by_parent = defaultdict(list)
             for parent, name in batch:
@@ -663,7 +684,7 @@ async def cleanup_empty_dirs(token: str, base_url: str, root_dir: str,
     headers = {"Authorization": token}
     payload = {"path": root_dir, "page": 1, "per_page": 0}
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        async with ProxiedClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             async with session.post(list_url, json=payload, headers=headers) as resp:
                 if resp.status != 200:
                     return 0, f"❌ 无法访问路径 {root_dir}: 状态码 {resp.status}"
@@ -688,7 +709,7 @@ async def cleanup_empty_dirs(token: str, base_url: str, root_dir: str,
         name = os.path.basename(dir_path)
         merged_groups[parent].append(name)
 
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=config.MAX_CONCURRENT_REQUESTS)) as session:
+    async with ProxiedClientSession(connector=aiohttp.TCPConnector(limit=config.MAX_CONCURRENT_REQUESTS)) as session:
         async def delete_empty_batch(parent: str, names: List[str], retry_count: int = 0) -> Tuple[int, str]:
             max_retries = 5
             base_delay = 1
@@ -765,7 +786,7 @@ async def auto_clean(context: ContextTypes.DEFAULT_TYPE) -> None:
             dir_msg = []
             try:
                 # 验证目录存在
-                async with aiohttp.ClientSession() as session:
+                async with ProxiedClientSession() as session:
                     list_url = f"{base_url.rstrip('/')}/api/fs/list"
                     headers = {"Authorization": token}
                     payload = {"path": target_dir, "page": 1, "per_page": 0}
@@ -786,7 +807,7 @@ async def auto_clean(context: ContextTypes.DEFAULT_TYPE) -> None:
             except aiohttp.ClientError as e:
                 error_detail = f"HTTP 错误: {str(e)}"
                 try:
-                    async with aiohttp.ClientSession() as session:
+                    async with ProxiedClientSession() as session:
                         async with session.post(list_url, json=payload, headers=headers) as resp:
                             error_detail += f", 状态码: {resp.status}, 响应: {await resp.text()[:100]}"
                 except Exception as inner_e:
@@ -857,7 +878,7 @@ async def find_download_directory(token: str, base_url: str, parent_dir: str, or
         if not parent_dir.startswith('/'):
             parent_dir = f'/{parent_dir}'
         list_payload = {"path": parent_dir, "page": 1, "per_page": 0}
-        async with aiohttp.ClientSession() as session:
+        async with ProxiedClientSession() as session:
             async with session.post(list_url, json=list_payload, headers=headers, timeout=20) as response:
                 response.raise_for_status()
                 list_result = await response.json()
@@ -961,7 +982,7 @@ async def list_directory(token: str, base_url: str, path: str) -> List[Dict]:
     headers = {"Authorization": token, "Content-Type": "application/json"}
     payload = {"path": path, "page": 1, "per_page": 0}
     try:
-        async with aiohttp.ClientSession() as session:
+        async with ProxiedClientSession() as session:
             async with session.post(url, json=payload, headers=headers, timeout=15) as response:
                 # 处理非200状态码
                 if response.status != 200:
@@ -1022,7 +1043,7 @@ async def create_directory_recursive(token: str, path: str) -> bool:
                     headers = {"Authorization": token}
                     data = {"path": full_path}
                     
-                    async with aiohttp.ClientSession() as session:
+                    async with ProxiedClientSession() as session:
                         async with session.post(mkdir_url, json=data, headers=headers, timeout=15) as response:
                             if response.status != 200:
                                 logger.error(f"创建目录失败 HTTP {response.status}: {full_path}")
@@ -1095,7 +1116,7 @@ async def move_items(token: str, src_dir: str, names: List[str], dst_dir: str) -
     }
     
     try:
-        async with aiohttp.ClientSession() as session:
+        async with ProxiedClientSession() as session:
             async with session.post(url, json=data, headers=headers, timeout=30) as resp:
                 result = await resp.json()
                 if resp.status == 200 and result.get("code") == 200:
@@ -1565,7 +1586,7 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE, to
     chat_id = update.effective_chat.id
     processing_msg = await update.effective_message.reply_text("🔄 正在刷新 Alist 文件列表...")
     try:
-        async with aiohttp.ClientSession() as session:
+        async with ProxiedClientSession() as session:
             async with session.post(refresh_url, json=payload, headers=headers, timeout=30) as response:
                 response.raise_for_status()
                 result = await response.json()
@@ -1767,7 +1788,11 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     """启动机器人"""
-    application = Application.builder().token(config.TELEGRAM_TOKEN).build()
+    application_builder = Application.builder().token(config.TELEGRAM_TOKEN)
+    if config.PROXY_URL:
+        application_builder = application_builder.proxy(config.PROXY_URL).get_updates_proxy(config.PROXY_URL)
+        logger.info(f"代理已启用: {config.PROXY_URL.rsplit('@', 1)[-1]}")
+    application = application_builder.build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("classify", classify_command))
