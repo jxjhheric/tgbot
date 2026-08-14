@@ -92,48 +92,211 @@ chmod 600 .env
 
 停止程序使用 `Ctrl+C`。
 
-## systemd 部署
+## 下载包部署
 
-推荐使用 systemd 管理进程：
+以下步骤适用于 Ubuntu amd64 VPS。下载包已经包含可执行文件、配置模板、systemd 文件和本说明文档，不需要在 VPS 上安装 Go。
+
+### 1. 下载并解压
 
 ```bash
-sudo useradd --system --home /var/lib/tgbot --create-home tgbot
+sudo apt update
+sudo apt install -y wget tar
+
+cd /tmp
+wget https://github.com/jxjhheric/tgbot/releases/download/go-v1.0.1/tgbot-linux-amd64.tar.gz
+tar -xzf tgbot-linux-amd64.tar.gz
+cd tgbot-linux-amd64
+```
+
+确认文件：
+
+```bash
+ls -lh
+```
+
+应当看到：
+
+```text
+tgbot
+tgbot.env.example
+tgbot.service
+README.md
+```
+
+### 2. 创建运行用户和目录
+
+systemd 会使用独立的 `tgbot` 用户运行程序：
+
+```bash
+sudo useradd --system --home /var/lib/tgbot --create-home tgbot 2>/dev/null || true
 sudo mkdir -p /opt/tgbot /etc/tgbot /var/lib/tgbot
 sudo install -m 0755 tgbot /opt/tgbot/tgbot
-sudo cp .env /etc/tgbot/tgbot.env
-sudo chmod 600 /etc/tgbot/tgbot.env
-sudo cp deploy/systemd/tgbot.service /etc/systemd/system/tgbot.service
+sudo chown -R tgbot:tgbot /opt/tgbot /var/lib/tgbot
+```
+
+### 3. 创建配置文件
+
+复制配置模板：
+
+```bash
+sudo cp tgbot.env.example /etc/tgbot/tgbot.env
+sudo nano /etc/tgbot/tgbot.env
+```
+
+至少填写以下变量：
+
+```dotenv
+TELEGRAM_TOKEN=你的TelegramBotToken
+ALIST_BASE_URL=https://你的Alist地址
+ALIST_TOKEN=你的AlistToken
+ALIST_OFFLINE_DIRS=/downloads
+JAV_SEARCH_APIS=https://你的搜索API地址
+ALLOWED_USER_IDS=你的Telegram用户数字ID
+```
+
+常用配置示例：
+
+```dotenv
+PROXY_URL=http://127.0.0.1:7890
+CLEAN_INTERVAL_MINUTES=60
+SIZE_THRESHOLD=100
+PREFERRED_KEYWORDS=中字,无码
+CUSTOM_CATEGORIES=动漫:anime,动画;中文:chinese
+SYSTEM_FOLDERS=/JAV,/其他
+EXCLUDE_SUFFIXES=.nfo,.txt
+```
+
+保护配置文件：
+
+```bash
+sudo chown root:tgbot /etc/tgbot/tgbot.env
+sudo chmod 640 /etc/tgbot/tgbot.env
+sudo chown -R tgbot:tgbot /var/lib/tgbot
+```
+
+### 4. 安装 systemd 服务
+
+```bash
+sudo cp tgbot.service /etc/systemd/system/tgbot.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now tgbot
 ```
 
-查看状态和日志：
+`enable` 表示 VPS 重启后自动启动，`--now` 表示立即启动。
+
+### 5. 检查运行状态
 
 ```bash
 sudo systemctl status tgbot
+```
+
+持续查看日志：
+
+```bash
 sudo journalctl -u tgbot -f
 ```
 
-修改配置后重启：
+正常启动时日志中会显示类似：
+
+```text
+loaded environment file: /etc/tgbot/tgbot.env
+tgbot Go service started
+```
+
+### 6. 修改配置
+
+编辑配置：
+
+```bash
+sudo nano /etc/tgbot/tgbot.env
+```
+
+推荐重启服务使全部配置生效：
 
 ```bash
 sudo systemctl restart tgbot
 ```
 
-也可以使用 Telegram 命令 `/reload_config` 重新读取配置。修改清理间隔、代理或搜索 API 后，建议同时重启服务。
+也可以通过 Telegram 发送 `/reload_config` 热加载配置。修改代理、搜索 API 或清理间隔后，建议使用 `systemctl restart`。
 
-## 直接下载可执行文件
-
-Ubuntu amd64 可执行文件可从 Release 下载：
+### 7. 常用 systemd 命令
 
 ```bash
-wget https://github.com/jxjhheric/tgbot/releases/download/go-v1.0.0/tgbot-linux-amd64.tar.gz
-tar -xzf tgbot-linux-amd64.tar.gz
-cd tgbot-linux-amd64
-chmod +x tgbot
+# 启动
+sudo systemctl start tgbot
+
+# 停止
+sudo systemctl stop tgbot
+
+# 重启
+sudo systemctl restart tgbot
+
+# 查看状态
+sudo systemctl status tgbot
+
+# 设置开机启动
+sudo systemctl enable tgbot
+
+# 取消开机启动
+sudo systemctl disable tgbot
+
+# 查看最近 100 行日志
+sudo journalctl -u tgbot -n 100 --no-pager
 ```
 
-压缩包包含可执行文件、配置模板、systemd 文件和本说明文档。
+### 8. 升级程序
+
+下载新版本后，先停止服务，再替换二进制文件：
+
+```bash
+sudo systemctl stop tgbot
+cd /tmp/tgbot-linux-amd64
+sudo install -m 0755 tgbot /opt/tgbot/tgbot
+sudo chown tgbot:tgbot /opt/tgbot/tgbot
+sudo systemctl start tgbot
+sudo systemctl status tgbot
+```
+
+配置文件位于 `/etc/tgbot/tgbot.env`，升级时不会被覆盖。
+
+### 9. 卸载服务
+
+```bash
+sudo systemctl disable --now tgbot
+sudo rm -f /etc/systemd/system/tgbot.service
+sudo systemctl daemon-reload
+sudo rm -rf /opt/tgbot
+sudo rm -rf /var/lib/tgbot
+sudo rm -f /etc/tgbot/tgbot.env
+sudo userdel tgbot 2>/dev/null || true
+```
+
+### 10. 常见问题
+
+如果出现 `missing environment variables`：
+
+```bash
+sudo grep -v '^#' /etc/tgbot/tgbot.env
+sudo systemctl restart tgbot
+sudo journalctl -u tgbot -n 50 --no-pager
+```
+
+检查变量名是否拼写正确，等号两侧不要添加多余空格。`ALLOWED_USER_IDS` 必须填写 Telegram 数字用户 ID，多个 ID 用逗号分隔。
+
+如果出现 `Permission denied`：
+
+```bash
+sudo chmod 0755 /opt/tgbot/tgbot
+sudo chown tgbot:tgbot /opt/tgbot/tgbot
+```
+
+如果 Telegram 无响应，先查看日志，再检查 VPS 是否能访问 Telegram API：
+
+```bash
+curl -I https://api.telegram.org
+```
+
+如果网络需要代理，在 `/etc/tgbot/tgbot.env` 中配置 `PROXY_URL` 后重启服务。
 
 ## 代理格式
 
