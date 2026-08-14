@@ -71,6 +71,6 @@ sudo systemctl enable --now tgbot
 sudo systemctl status tgbot
 ```
 
-如果 VPS 的 Go 版本较新，也可以先执行 `go mod tidy`，再执行上面的 `go build`。
+首次编译前执行 `go mod tidy` 生成依赖校验文件，再执行上面的 `go build`。
 
 编辑 `/etc/tgbot/tgbot.env` 后执行 `sudo systemctl restart tgbot`。日志使用 `journalctl -u tgbot -f` 查看。`PROXY_URL` 支持 HTTP/HTTPS 和 SOCKS5，例如 `socks5://127.0.0.1:7891`。
