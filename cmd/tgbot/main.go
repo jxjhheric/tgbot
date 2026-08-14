@@ -294,9 +294,9 @@ func (b *Bot) help(ctx context.Context, message *TelegramMessage) {
 func (b *Bot) handleSingle(ctx context.Context, message *TelegramMessage, entry string) {
 	status := b.sendMessage(ctx, message.Chat.ID, "🔍 处理："+entry)
 	magnet, err := b.resolveEntry(ctx, entry)
-	if err != nil { b.editMessage(ctx, message.Chat.ID, status, "❌ "+err); return }
+	if err != nil { b.editMessage(ctx, message.Chat.ID, status, "❌ "+err.Error()); return }
 	result, err := b.addOfflineDownload(ctx, []string{magnet})
-	if err != nil { b.editMessage(ctx, message.Chat.ID, status, "❌ "+err); return }
+	if err != nil { b.editMessage(ctx, message.Chat.ID, status, "❌ "+err.Error()); return }
 	b.editMessage(ctx, message.Chat.ID, status, "✅ 已添加到下载队列")
 	if b.notifyEnabled(message.From.ID, true) { b.sendMessage(ctx, message.Chat.ID, "✅ 任务完成："+entry) }
 }
@@ -739,7 +739,7 @@ func (b *Bot) removeWithRetry(ctx context.Context, directory string, names []str
 	var last error
 	for attempt := 0; attempt < 6; attempt++ {
 		requestCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		result, err := b.alist(requestCtx, "/api/fs/remove", map[string]interface{}{"dir": directory, "names": names})
+		_, err := b.alist(requestCtx, "/api/fs/remove", map[string]interface{}{"dir": directory, "names": names})
 		cancel()
 		if err == nil { return nil }
 		last = err
