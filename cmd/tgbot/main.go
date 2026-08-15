@@ -134,6 +134,7 @@ type SearchEntry struct {
 	Name     string
 	Size     int64
 	Seeders  int
+	Leechers int
 	Date     time.Time
 	Source   string
 }
@@ -412,7 +413,7 @@ func (b *Bot) searchMagnet(ctx context.Context, code string) (string, error) {
 	if len(unique) == 0 { return "", fmt.Errorf("未找到番号 %s 的相关资源", code) }
 	all = all[:0]
 	for _, entry := range unique { all = append(all, entry) }
-	sort.SliceStable(all, func(i, j int) bool { return b.entryScore(all[i]) > b.entryScore(all[j]) })
+	sort.SliceStable(all, func(i, j int) bool { return b.entryBetter(all[i], all[j]) })
 	return all[0].Magnet, nil
 }
 
@@ -452,6 +453,11 @@ func (b *Bot) scrapeSukebei(ctx context.Context, code string) []SearchEntry {
 		entry := SearchEntry{Magnet: html.UnescapeString(magnet), Name: strings.TrimSpace(html.UnescapeString(name)), Source: "sukebei"}
 		if len(cells) > 2 { entry.Size = parseSize(stripTags(cells[2][1])) }
 		if len(cells) > 4 { entry.Date = parseDate(stripTags(cells[4][1])) }
+		centerCells := regexp.MustCompile(`(?is)<td[^>]*class=["'][^"']*\btext-center\b[^"']*["'][^>]*>(.*?)</td>`).FindAllStringSubmatch(content, -1)
+		if len(centerCells) >= 5 {
+			entry.Seeders = parseIntValue(stripTags(centerCells[2][1]))
+			entry.Leechers = parseIntValue(stripTags(centerCells[3][1]))
+		}
 		result = append(result, entry)
 	}
 	return result
@@ -471,11 +477,23 @@ func parseSearchValue(raw interface{}) (SearchEntry, bool) {
 	return SearchEntry{Magnet: parts[1], Name: parts[2], Size: parseSize(parts[3]), Date: parseDate(parts[4]), Source: "api"}, true
 }
 
-func (b *Bot) entryScore(entry SearchEntry) int64 {
-	score := entry.Size + entry.Date.Unix() + int64(entry.Seeders)*1000000000
-	name := strings.ToLower(entry.Name)
-	for _, keyword := range b.cfg.PreferredWords { if strings.Contains(name, keyword) { score += 1000000000000000; break } }
-	return score
+func (b *Bot) entryBetter(left, right SearchEntry) bool {
+	leftPreferred := b.hasPreferredWord(left.Name)
+	rightPreferred := b.hasPreferredWord(right.Name)
+	if leftPreferred != rightPreferred { return leftPreferred }
+	if left.Seeders != right.Seeders { return left.Seeders > right.Seeders }
+	if !left.Date.Equal(right.Date) {
+		if left.Date.IsZero() { return false }
+		if right.Date.IsZero() { return true }
+		return left.Date.After(right.Date)
+	}
+	return left.Size > right.Size
+}
+
+func (b *Bot) hasPreferredWord(name string) bool {
+	lowerName := strings.ToLower(name)
+	for _, keyword := range b.cfg.PreferredWords { if strings.Contains(lowerName, keyword) { return true } }
+	return false
 }
 
 func (b *Bot) addOfflineDownload(ctx context.Context, links []string) (bool, error) {
@@ -977,6 +995,7 @@ func normalizePath(value string) string { value = strings.ReplaceAll(value, "\\"
 func isSystemPath(value string, folders []string) bool { normalized := strings.ToLower(normalizePath(value)); for _, folder := range folders { normalizedFolder := strings.ToLower(normalizePath(folder)); if normalized == normalizedFolder || strings.HasPrefix(normalized, normalizedFolder+"/") { return true } }; return false }
 func parseSize(value string) int64 { match := regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(kb|mb|gb|tb)`).FindStringSubmatch(value); if len(match) != 3 { return 0 }; multiplier := map[string]float64{"kb": 1024, "mb": 1024 * 1024, "gb": 1024 * 1024 * 1024, "tb": 1024 * 1024 * 1024 * 1024}; return int64(parseFloat(match[1]) * multiplier[strings.ToLower(match[2])]) }
 func parseFloat(value string) float64 { result, _ := strconv.ParseFloat(value, 64); return result }
+func parseIntValue(value string) int { result, _ := strconv.Atoi(strings.TrimSpace(value)); return result }
 func beijingNow() time.Time { return time.Now().In(time.FixedZone("CST", 8*60*60)) }
 func parseDate(value string) time.Time { for _, layout := range []string{"2006-01-02", "2006-01-02 15:04"} { if result, err := time.Parse(layout, value); err == nil { return result } }; return time.Time{} }
 func stripTags(value string) string { return regexp.MustCompile(`(?s)<[^>]+>`).ReplaceAllString(value, "") }
