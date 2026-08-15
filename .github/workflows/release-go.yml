@@ -29,9 +29,6 @@ jobs:
           go test ./...
           mkdir -p release/tgbot-linux-amd64
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o release/tgbot-linux-amd64/tgbot ./cmd/tgbot
-          cp .env.go.example release/tgbot-linux-amd64/tgbot.env.example
-          cp deploy/systemd/tgbot.service release/tgbot-linux-amd64/tgbot.service
-          cp README.md release/tgbot-linux-amd64/README.md
           tar -C release -czf tgbot-linux-amd64.tar.gz tgbot-linux-amd64
 
       - name: Create GitHub release

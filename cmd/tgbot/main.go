@@ -444,10 +444,11 @@ func (b *Bot) scrapeSukebei(ctx context.Context, code string) []SearchEntry {
 	result := make([]SearchEntry, 0, len(rows))
 	for _, row := range rows {
 		content := string(row[1])
-		name := stripTags(firstMatch(content, `(?is)<td[^>]*>\s*<a[^>]*>(.*?)</a>`))
+		cells := regexp.MustCompile(`(?is)<td[^>]*>(.*?)</td>`).FindAllStringSubmatch(content, -1)
+		name := ""
+		if len(cells) > 1 { name = stripTags(cells[1][1]) }
 		magnet := firstMatch(content, `(?is)href=["'](magnet:\?[^"']+)`)
 		if magnet == "" || !isFanhaoMatch(code, html.UnescapeString(name)) { continue }
-		cells := regexp.MustCompile(`(?is)<td[^>]*>(.*?)</td>`).FindAllStringSubmatch(content, -1)
 		entry := SearchEntry{Magnet: html.UnescapeString(magnet), Name: strings.TrimSpace(html.UnescapeString(name)), Source: "sukebei"}
 		if len(cells) > 2 { entry.Size = parseSize(stripTags(cells[2][1])) }
 		if len(cells) > 4 { entry.Date = parseDate(stripTags(cells[4][1])) }
