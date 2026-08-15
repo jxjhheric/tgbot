@@ -914,7 +914,7 @@ func (b *Bot) runScheduledCleanup(ctx context.Context) {
 	for userID := range b.cfg.AllowedUsers { users = append(users, userID) }
 	b.cfgMu.RUnlock()
 	directories = topLevelDirectories(directories)
-	start := fmt.Sprintf("🔄 自动清理任务启动\n• 时间: %s", time.Now().Format("2006-01-02 15:04:05"))
+	start := fmt.Sprintf("🔄 自动清理任务启动\n• 时间: %s", beijingNow().Format("2006-01-02 15:04:05"))
 	for _, userID := range users {
 		if b.notifyEnabled(userID, false) { b.sendMessage(ctx, userID, start); time.Sleep(300 * time.Millisecond) }
 	}
@@ -926,7 +926,7 @@ func (b *Bot) runScheduledCleanup(ctx context.Context) {
 		log.Printf("scheduled cleanup %s: files=%d dirs=%d", directory, files, dirs)
 		time.Sleep(time.Second)
 	}
-	summary := "✅ 自动清理完成\n• 时间: " + time.Now().Format("2006-01-02 15:04:05") + "\n" + strings.Join(results, "\n")
+	summary := "✅ 自动清理完成\n• 时间: " + beijingNow().Format("2006-01-02 15:04:05") + "\n" + strings.Join(results, "\n")
 	for _, userID := range users {
 		if !b.notifyEnabled(userID, false) { continue }
 		for _, part := range splitMessage(summary, 4000) { b.sendMessage(ctx, userID, part); time.Sleep(300 * time.Millisecond) }
@@ -976,6 +976,7 @@ func normalizePath(value string) string { value = strings.ReplaceAll(value, "\\"
 func isSystemPath(value string, folders []string) bool { normalized := strings.ToLower(normalizePath(value)); for _, folder := range folders { normalizedFolder := strings.ToLower(normalizePath(folder)); if normalized == normalizedFolder || strings.HasPrefix(normalized, normalizedFolder+"/") { return true } }; return false }
 func parseSize(value string) int64 { match := regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(kb|mb|gb|tb)`).FindStringSubmatch(value); if len(match) != 3 { return 0 }; multiplier := map[string]float64{"kb": 1024, "mb": 1024 * 1024, "gb": 1024 * 1024 * 1024, "tb": 1024 * 1024 * 1024 * 1024}; return int64(parseFloat(match[1]) * multiplier[strings.ToLower(match[2])]) }
 func parseFloat(value string) float64 { result, _ := strconv.ParseFloat(value, 64); return result }
+func beijingNow() time.Time { return time.Now().In(time.FixedZone("CST", 8*60*60)) }
 func parseDate(value string) time.Time { for _, layout := range []string{"2006-01-02", "2006-01-02 15:04"} { if result, err := time.Parse(layout, value); err == nil { return result } }; return time.Time{} }
 func stripTags(value string) string { return regexp.MustCompile(`(?s)<[^>]+>`).ReplaceAllString(value, "") }
 func firstMatch(value, expression string) string { match := regexp.MustCompile(expression).FindStringSubmatch(value); if len(match) > 1 { return match[1] }; return "" }
