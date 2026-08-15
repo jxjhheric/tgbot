@@ -94,7 +94,7 @@ chmod 600 .env
 
 ## 下载包部署
 
-以下步骤适用于 Ubuntu amd64 VPS。下载包已经包含可执行文件、配置模板、systemd 文件和本说明文档，不需要在 VPS 上安装 Go。
+以下步骤适用于 Ubuntu amd64 VPS。最新下载包只包含 `tgbot` 可执行文件，不需要在 VPS 上安装 Go；配置文件和 systemd 服务需要按下面步骤创建。
 
 ### 1. 下载并解压
 
@@ -103,9 +103,11 @@ sudo apt update
 sudo apt install -y wget tar
 
 cd /tmp
-wget https://github.com/jxjhheric/tgbot/releases/download/go-v1.0.1/tgbot-linux-amd64.tar.gz
+wget https://github.com/jxjhheric/tgbot/releases/download/go-v1.0.3/tgbot-linux-amd64.tar.gz
 tar -xzf tgbot-linux-amd64.tar.gz
 cd tgbot-linux-amd64
+wget -O tgbot.env.example https://raw.githubusercontent.com/jxjhheric/tgbot/go-vps-systemd/.env.go.example
+wget -O tgbot.service https://raw.githubusercontent.com/jxjhheric/tgbot/go-vps-systemd/deploy/systemd/tgbot.service
 ```
 
 确认文件：
@@ -120,7 +122,6 @@ ls -lh
 tgbot
 tgbot.env.example
 tgbot.service
-README.md
 ```
 
 ### 2. 创建运行用户和目录
@@ -246,18 +247,19 @@ sudo journalctl -u tgbot -n 100 --no-pager
 
 ### 8. 升级程序
 
-下载新版本后，先停止服务，再替换二进制文件：
+可以使用一键升级脚本。脚本会自动获取最新的 `go-v*` Release，备份旧程序，替换二进制并重启服务；启动失败时会自动恢复备份：
 
 ```bash
-sudo systemctl stop tgbot
-cd /tmp/tgbot-linux-amd64
-sudo install -m 0755 tgbot /opt/tgbot/tgbot
-sudo chown tgbot:tgbot /opt/tgbot/tgbot
-sudo systemctl start tgbot
-sudo systemctl status tgbot
+curl -fsSL https://raw.githubusercontent.com/jxjhheric/tgbot/go-vps-systemd/deploy/upgrade.sh | sudo bash
 ```
 
-配置文件位于 `/etc/tgbot/tgbot.env`，升级时不会被覆盖。
+脚本默认升级到最新版本。如果需要指定版本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jxjhheric/tgbot/go-vps-systemd/deploy/upgrade.sh | sudo env TGBOT_VERSION=go-v1.0.3 bash
+```
+
+升级前会在 `/opt/tgbot/tgbot.backup.YYYYMMDDHHMMSS` 保存旧程序。配置文件 `/etc/tgbot/tgbot.env`、systemd 服务和 `/var/lib/tgbot/state.json` 不会被覆盖。
 
 ### 9. 卸载服务
 
@@ -320,9 +322,9 @@ PROXY_URL=socks5://127.0.0.1:7891
 
 ## GitHub Actions
 
-推送到 `go-vps-systemd` 会运行 Go 测试和 Linux amd64 编译。推送 `go-v*` 标签会自动创建公开 Release：
+推送到 `go-vps-systemd` 会运行 Go 测试和 Linux amd64 编译。推送 `go-v*` 标签会自动创建公开 Release，压缩包只包含 Linux amd64 的 `tgbot` 可执行文件：
 
 ```bash
-git tag go-v1.0.1
-git push origin go-v1.0.1
+git tag go-v1.0.3
+git push origin go-v1.0.3
 ```
