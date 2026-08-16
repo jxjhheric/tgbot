@@ -837,7 +837,8 @@ func (b *Bot) cleanCommand(ctx context.Context, message *TelegramMessage, args [
 		deletedDirs += b.cleanEmptyDirectories(ctx, target)
 		b.editMessage(ctx, message.Chat.ID, status, fmt.Sprintf("🧹 清理中...\n• 已处理目录: %s\n• 删除小文件: %d\n• 删除空目录: %d", target, deletedFiles, deletedDirs))
 	}
-	b.editMessage(ctx, message.Chat.ID, status, fmt.Sprintf("✅ 清理完成\n• 删除小文件: %d\n• 删除空目录: %d", deletedFiles, deletedDirs))
+	renameCount := b.renameOfflineDirectories(ctx)
+	b.editMessage(ctx, message.Chat.ID, status, fmt.Sprintf("✅ 清理完成\n• 删除小文件: %d\n• 删除空目录: %d\n• 重命名文件夹: %d", deletedFiles, deletedDirs, renameCount))
 	b.refreshDirectory(ctx, message.Chat.ID, current)
 }
 
@@ -899,6 +900,42 @@ func (b *Bot) removeWithRetry(ctx context.Context, directory string, names []str
 	return last
 }
 
+func (b *Bot) renameOfflineDirectories(ctx context.Context) int {
+	b.cfgMu.RLock()
+	offlineDirs := append([]string(nil), b.cfg.OfflineDirs...)
+	b.cfgMu.RUnlock()
+	renamed := 0
+	for _, directory := range offlineDirs {
+		directory = normalizePath(directory)
+		for _, item := range b.listDirectory(ctx, directory) {
+			if !item.IsDir { continue }
+			newName, ok := trimFolderPrefix(item.Name)
+			if !ok { continue }
+			oldPath := normalizePath(directory + "/" + item.Name)
+			if b.nameExists(ctx, directory, newName) {
+				log.Printf("skip folder rename due to name conflict: %s -> %s", oldPath, newName)
+				continue
+			}
+			if err := b.renameDirectory(ctx, oldPath, newName); err != nil {
+				log.Printf("rename folder failed: %s -> %s: %v", oldPath, newName, err)
+				continue
+			}
+			renamed++
+		}
+	}
+	return renamed
+}
+
+func (b *Bot) renameDirectory(ctx context.Context, directory, name string) error {
+	_, err := b.alist(ctx, "/api/fs/rename", map[string]string{"path": normalizePath(directory), "name": name})
+	return err
+}
+
+func (b *Bot) nameExists(ctx context.Context, directory, name string) bool {
+	for _, item := range b.listDirectory(ctx, directory) { if item.Name == name { return true } }
+	return false
+}
+
 func (b *Bot) cleanLoop(ctx context.Context) {
 	var ticker *time.Ticker
 	var tick <-chan time.Time
@@ -945,6 +982,9 @@ func (b *Bot) runScheduledCleanup(ctx context.Context) {
 		log.Printf("scheduled cleanup %s: files=%d dirs=%d", directory, files, dirs)
 		time.Sleep(time.Second)
 	}
+	renameCount := b.renameOfflineDirectories(ctx)
+	results = append(results, fmt.Sprintf("• 文件夹改名: 成功 %d 个", renameCount))
+	log.Printf("scheduled cleanup folder rename: renamed=%d", renameCount)
 	summary := "✅ 自动清理完成\n• 时间: " + beijingNow().Format("2006-01-02 15:04:05") + "\n" + strings.Join(results, "\n")
 	for _, userID := range users {
 		if !b.notifyEnabled(userID, false) { continue }
@@ -996,6 +1036,18 @@ func isSystemPath(value string, folders []string) bool { normalized := strings.T
 func parseSize(value string) int64 { match := regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(kb|mb|gb|tb)`).FindStringSubmatch(value); if len(match) != 3 { return 0 }; multiplier := map[string]float64{"kb": 1024, "mb": 1024 * 1024, "gb": 1024 * 1024 * 1024, "tb": 1024 * 1024 * 1024 * 1024}; return int64(parseFloat(match[1]) * multiplier[strings.ToLower(match[2])]) }
 func parseFloat(value string) float64 { result, _ := strconv.ParseFloat(value, 64); return result }
 func parseIntValue(value string) int { result, _ := strconv.Atoi(strings.TrimSpace(value)); return result }
+func trimFolderPrefix(name string) (string, bool) {
+	remaining := strings.TrimSpace(name)
+	removed := false
+	for strings.HasPrefix(remaining, "【") {
+		end := strings.Index(remaining, "】")
+		if end < 0 { break }
+		remaining = strings.TrimSpace(remaining[end+len("】"):])
+		removed = true
+	}
+	if !removed || remaining == "" { return "", false }
+	return remaining, true
+}
 func beijingNow() time.Time { return time.Now().In(time.FixedZone("CST", 8*60*60)) }
 func parseDate(value string) time.Time { for _, layout := range []string{"2006-01-02", "2006-01-02 15:04"} { if result, err := time.Parse(layout, value); err == nil { return result } }; return time.Time{} }
 func stripTags(value string) string { return regexp.MustCompile(`(?s)<[^>]+>`).ReplaceAllString(value, "") }
