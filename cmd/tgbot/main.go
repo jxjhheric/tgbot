@@ -157,11 +157,13 @@ type MukakuMovie struct {
 }
 
 type MukakuResource struct {
-	ID     int64
-	Name   string
-	Size   string
-	Date   string
-	Magnet string
+	ID       int64
+	Name     string
+	Quality  string
+	Subtitle string
+	Size     string
+	Date     string
+	Magnet   string
 }
 
 type MukakuSession struct {
@@ -544,11 +546,13 @@ func (b *Bot) mukakuResources(ctx context.Context, movieID int64) ([]MukakuResou
 		Message string `json:"message"`
 		Data struct {
 			AllSeeds []struct {
-				ID     int64  `json:"id"`
-				Zname  string `json:"zname"`
-				Zsize  string `json:"zsize"`
-				Date   string `json:"ezt"`
-				Zlink  string `json:"zlink"`
+				ID       int64  `json:"id"`
+				Zname    string `json:"zname"`
+				Zqxd     string `json:"zqxd"`
+				TextHTML string `json:"text_html"`
+				Zsize    string `json:"zsize"`
+				Date     string `json:"ezt"`
+				Zlink    string `json:"zlink"`
 			} `json:"all_seeds"`
 		} `json:"data"`
 	}
@@ -556,7 +560,9 @@ func (b *Bot) mukakuResources(ctx context.Context, movieID int64) ([]MukakuResou
 	if !response.Success { return nil, errors.New(response.Message) }
 	resources := make([]MukakuResource, 0, len(response.Data.AllSeeds))
 	for _, item := range response.Data.AllSeeds {
-		if strings.HasPrefix(item.Zlink, "magnet:?") { resources = append(resources, MukakuResource{ID: item.ID, Name: item.Zname, Size: item.Zsize, Date: item.Date, Magnet: item.Zlink}) }
+		if strings.HasPrefix(item.Zlink, "magnet:?") {
+			resources = append(resources, MukakuResource{ID: item.ID, Name: item.Zname, Quality: item.Zqxd, Subtitle: stripTags(item.TextHTML), Size: item.Zsize, Date: item.Date, Magnet: item.Zlink})
+		}
 	}
 	if len(resources) > 10 { resources = resources[:10] }
 	return resources, nil
@@ -577,13 +583,33 @@ func limitText(value string, max int) string {
 }
 
 func mukakuResourceLabel(resource MukakuResource) string {
-	resolution := firstMatch(resource.Name, `(?i)\b(?:4320|2160|1080|720|576|480)p\b`)
+	resolution := firstMatch(resource.Name, `(?i)\b((?:4320|2160|1080|720|576|480)p)\b`)
+	if resolution == "" { resolution = firstMatch(resource.Quality, `(?i)\b(8k|4k|(?:4320|2160|1080|720|576|480)p)\b`) }
 	if resolution == "" { resolution = "未知分辨率" }
-	codec := firstMatch(resource.Name, `(?i)\b(?:x265|h[ .]?265|hevc|x264|h[ .]?264|avc|av1|xvid|vp9)\b`)
+	codec := firstMatch(resource.Name, `(?i)\b(x265|h[ .]?265|hevc|x264|h[ .]?264|avc|av1|xvid|vp9)\b`)
 	if codec == "" { codec = "未知编码" }
 	codec = strings.ToUpper(strings.ReplaceAll(codec, " ", ""))
 	if resource.Size == "" { resource.Size = "未知大小" }
-	return limitText(fmt.Sprintf("%s · %s · %s", strings.ToUpper(resolution), codec, resource.Size), 55)
+	subtitle := extractSubtitle(resource.Name)
+	if subtitle == "" { subtitle = strings.TrimSpace(resource.Subtitle) }
+	parts := []string{strings.ToUpper(resolution), codec}
+	if subtitle != "" { parts = append(parts, subtitle) }
+	parts = append(parts, resource.Size)
+	return limitText(strings.Join(parts, " · "), 55)
+}
+
+func extractSubtitle(name string) string {
+	groups := regexp.MustCompile(`[\[【]([^\]】]+)[\]】]`).FindAllStringSubmatch(name, -1)
+	keywords := regexp.MustCompile(`(?i)字幕|中字|双字|简繁|简中|繁中|中英|内嵌|外挂|特效字`)
+	for _, group := range groups {
+		if len(group) < 2 { continue }
+		for _, part := range regexp.MustCompile(`[+＋/／,，、]`).Split(group[1], -1) {
+			part = strings.TrimSpace(part)
+			if keywords.MatchString(part) { return part }
+		}
+		if keywords.MatchString(group[1]) { return strings.TrimSpace(group[1]) }
+	}
+	return ""
 }
 
 func isDirectLink(entry string) bool {
