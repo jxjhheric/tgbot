@@ -148,11 +148,12 @@ type SearchEntry struct {
 }
 
 type MukakuMovie struct {
-	ID    int64  `json:"id"`
-	Title string `json:"title"`
-	Year  string `json:"years"`
-	Class string `json:"class"`
-	Area  string `json:"production_area"`
+	ID     int64  `json:"id"`
+	DoubID int64  `json:"doub_id"`
+	Title  string `json:"title"`
+	Year   string `json:"years"`
+	Class  string `json:"class"`
+	Area   string `json:"production_area"`
 }
 
 type MukakuResource struct {
@@ -530,7 +531,7 @@ func (b *Bot) mukakuSearch(ctx context.Context, query string) ([]MukakuMovie, er
 }
 
 func (b *Bot) mukakuResources(ctx context.Context, movieID int64) ([]MukakuResource, error) {
-	endpoint, err := url.Parse(b.cfg.MukakuBaseURL + "/prod/api/v1/getTrDetail")
+	endpoint, err := url.Parse(b.cfg.MukakuBaseURL + "/prod/api/v1/getVideoDetail")
 	if err != nil { return nil, err }
 	params := endpoint.Query()
 	params.Set("app_id", b.cfg.MukakuAppID)
@@ -542,24 +543,19 @@ func (b *Bot) mukakuResources(ctx context.Context, movieID int64) ([]MukakuResou
 		Success bool `json:"success"`
 		Message string `json:"message"`
 		Data struct {
-			ID     int64 `json:"id"`
-			Zname  string `json:"zname"`
-			Zsize  string `json:"zsizea"`
-			Zlink  string `json:"zlink"`
-			Arrare []struct {
+			AllSeeds []struct {
 				ID     int64  `json:"id"`
 				Zname  string `json:"zname"`
 				Zsize  string `json:"zsize"`
-				Date   string `json:"eztime"`
+				Date   string `json:"ezt"`
 				Zlink  string `json:"zlink"`
-			} `json:"arrare"`
+			} `json:"all_seeds"`
 		} `json:"data"`
 	}
 	if err := b.requestJSONRetry(ctx, http.MethodGet, endpoint.String(), nil, &response, 20*time.Second, 2); err != nil { return nil, err }
 	if !response.Success { return nil, errors.New(response.Message) }
-	resources := make([]MukakuResource, 0, len(response.Data.Arrare)+1)
-	if strings.HasPrefix(response.Data.Zlink, "magnet:?") { resources = append(resources, MukakuResource{ID: response.Data.ID, Name: response.Data.Zname, Size: response.Data.Zsize, Magnet: response.Data.Zlink}) }
-	for _, item := range response.Data.Arrare {
+	resources := make([]MukakuResource, 0, len(response.Data.AllSeeds))
+	for _, item := range response.Data.AllSeeds {
 		if strings.HasPrefix(item.Zlink, "magnet:?") { resources = append(resources, MukakuResource{ID: item.ID, Name: item.Zname, Size: item.Zsize, Date: item.Date, Magnet: item.Zlink}) }
 	}
 	if len(resources) > 10 { resources = resources[:10] }
@@ -578,6 +574,16 @@ func limitText(value string, max int) string {
 	runes := []rune(value)
 	if len(runes) <= max { return value }
 	return string(runes[:max-1]) + "…"
+}
+
+func mukakuResourceLabel(resource MukakuResource) string {
+	resolution := firstMatch(resource.Name, `(?i)\b(?:4320|2160|1080|720|576|480)p\b`)
+	if resolution == "" { resolution = "未知分辨率" }
+	codec := firstMatch(resource.Name, `(?i)\b(?:x265|h[ .]?265|hevc|x264|h[ .]?264|avc|av1|xvid|vp9)\b`)
+	if codec == "" { codec = "未知编码" }
+	codec = strings.ToUpper(strings.ReplaceAll(codec, " ", ""))
+	if resource.Size == "" { resource.Size = "未知大小" }
+	return limitText(fmt.Sprintf("%s · %s · %s", strings.ToUpper(resolution), codec, resource.Size), 55)
 }
 
 func isDirectLink(entry string) bool {
@@ -1024,7 +1030,9 @@ func (b *Bot) handleMukakuMovie(ctx context.Context, query *CallbackQuery) {
 	index, err := strconv.Atoi(parts[3])
 	session, ok := b.getMukakuSession(parts[2], query.From.ID)
 	if err != nil || !ok || index < 0 || index >= len(session.Movies) { b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ 搜索结果已失效"); return }
-	resources, err := b.mukakuResources(ctx, session.Movies[index].ID)
+	movieID := session.Movies[index].DoubID
+	if movieID == 0 { movieID = session.Movies[index].ID }
+	resources, err := b.mukakuResources(ctx, movieID)
 	if err != nil {
 		log.Printf("Mukaku detail failed for %q: %v", session.Movies[index].Title, err)
 		b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ 获取资源失败，请稍后重试")
@@ -1036,10 +1044,7 @@ func (b *Bot) handleMukakuMovie(ctx context.Context, query *CallbackQuery) {
 	b.mukakuMu.Unlock()
 	keyboard := make([][]InlineKeyboardButton, 0, len(resources))
 	for resourceIndex, resource := range resources {
-		label := resource.Name
-		if label == "" { label = "未命名资源" }
-		if resource.Size != "" { label += " · " + resource.Size }
-		keyboard = append(keyboard, []InlineKeyboardButton{{Text: limitText(label, 55), CallbackData: fmt.Sprintf("mk_resource_%s_%d_%d", session.Token, index, resourceIndex)}})
+		keyboard = append(keyboard, []InlineKeyboardButton{{Text: mukakuResourceLabel(resource), CallbackData: fmt.Sprintf("mk_resource_%s_%d_%d", session.Token, index, resourceIndex)}})
 	}
 	b.editMessageWithMarkup(ctx, query.Message.Chat.ID, query.Message.MessageID, fmt.Sprintf("🎬 %s\n请选择资源：", mukakuMovieLabel(session.Movies[index])), InlineKeyboardMarkup{InlineKeyboard: keyboard})
 }
@@ -1065,7 +1070,7 @@ func (b *Bot) handleMukakuResource(ctx context.Context, query *CallbackQuery) {
 	b.mukakuMu.Lock()
 	session.Added[resource.Magnet] = true
 	b.mukakuMu.Unlock()
-	b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "✅ 已添加到下载队列："+limitText(resource.Name, 120))
+	b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "✅ 已添加到下载队列："+mukakuResourceLabel(resource))
 }
 
 func (b *Bot) cleanSmallFiles(ctx context.Context, root string) int {
