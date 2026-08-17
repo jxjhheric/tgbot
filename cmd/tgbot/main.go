@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,6 +52,10 @@ type Config struct {
 	MaxConcurrent    int
 	ExcludeSuffixes  []string
 	StateFile        string
+	MukakuBaseURL    string
+	MukakuAppID     string
+	MukakuIdentity  string
+	MukakuToken     string
 }
 
 type Category struct {
@@ -76,6 +81,9 @@ type Bot struct {
 	cleanMu    sync.Mutex
 	cleanWake  chan struct{}
 	apiSem     chan struct{}
+	mukakuMu   sync.Mutex
+	mukakuByID map[string]*MukakuSession
+	mukakuUser map[int64]string
 }
 
 type TelegramUpdate struct {
@@ -139,6 +147,32 @@ type SearchEntry struct {
 	Source   string
 }
 
+type MukakuMovie struct {
+	ID    int64  `json:"id"`
+	Title string `json:"title"`
+	Year  string `json:"years"`
+	Class string `json:"class"`
+	Area  string `json:"production_area"`
+}
+
+type MukakuResource struct {
+	ID     int64
+	Name   string
+	Size   string
+	Date   string
+	Magnet string
+}
+
+type MukakuSession struct {
+	Token     string
+	UserID    int64
+	Query     string
+	ExpiresAt time.Time
+	Movies    []MukakuMovie
+	Resources map[int][]MukakuResource
+	Added     map[string]bool
+}
+
 func main() {
 	if envFile := loadDotEnv(); envFile != "" {
 		log.Printf("loaded environment file: %s", envFile)
@@ -151,7 +185,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	bot := &Bot{cfg: cfg, client: client, cleanWake: make(chan struct{}, 1), apiSem: make(chan struct{}, cfg.MaxConcurrent)}
+	bot := &Bot{cfg: cfg, client: client, cleanWake: make(chan struct{}, 1), apiSem: make(chan struct{}, cfg.MaxConcurrent), mukakuByID: map[string]*MukakuSession{}, mukakuUser: map[int64]string{}}
 	if err := bot.loadState(); err != nil {
 		log.Printf("state load warning: %v", err)
 	}
@@ -236,6 +270,10 @@ func loadConfig() (Config, error) {
 		CustomCategories: parseCategories(os.Getenv("CUSTOM_CATEGORIES")),
 		SystemFolders:    normalizeCSVPaths(os.Getenv("SYSTEM_FOLDERS")),
 		ExcludeSuffixes:  lowerCSV(os.Getenv("EXCLUDE_SUFFIXES")),
+		MukakuBaseURL:    strings.TrimRight(envString("MUKAKU_BASE_URL", "https://web5.mukaku.com"), "/"),
+		MukakuAppID:      envString("MUKAKU_APP_ID", "83768d9ad4"),
+		MukakuIdentity:   envString("MUKAKU_IDENTITY", "23734adac0301bccdcb107c4aa21f96c"),
+		MukakuToken:      strings.TrimSpace(os.Getenv("MUKAKU_ACCESS_TOKEN")),
 		CleanBatchSize:   envInt("CLEAN_BATCH_SIZE", 500),
 		MaxConcurrent:    envInt("MAX_CONCURRENT_REQUESTS", 20),
 		StateFile:        envString("STATE_FILE", defaultStateFile),
@@ -363,6 +401,10 @@ func (b *Bot) help(ctx context.Context, message *TelegramMessage) {
 }
 
 func (b *Bot) handleSingle(ctx context.Context, message *TelegramMessage, entry string) {
+	if !isDirectLink(entry) && !fanhaoPattern.MatchString(entry) {
+		b.startMukakuSearch(ctx, message, strings.TrimSpace(entry))
+		return
+	}
 	status := b.sendMessage(ctx, message.Chat.ID, "🔍 处理："+entry)
 	magnet, err := b.resolveEntry(ctx, entry)
 	if err != nil { b.editMessage(ctx, message.Chat.ID, status, "❌ "+err.Error()); return }
@@ -380,6 +422,11 @@ func (b *Bot) handleBatch(ctx context.Context, message *TelegramMessage, entries
 	results := make([]string, 0, len(entries))
 	success := 0
 	for index, entry := range entries {
+		if !isDirectLink(entry) && !fanhaoPattern.MatchString(entry) {
+			b.startMukakuSearch(ctx, message, strings.TrimSpace(entry))
+			results = append(results, fmt.Sprintf("%d. %s: 已发送 Mukaku 搜索", index+1, short(entry)))
+			continue
+		}
 		magnet, err := b.resolveEntry(ctx, entry)
 		if err != nil { results = append(results, fmt.Sprintf("%d. %s: %s", index+1, short(entry), err)); continue }
 		if seen[magnet] { results = append(results, fmt.Sprintf("%d. %s: 重复", index+1, short(entry))); continue }
@@ -397,7 +444,7 @@ func (b *Bot) handleBatch(ctx context.Context, message *TelegramMessage, entries
 }
 
 func (b *Bot) resolveEntry(ctx context.Context, entry string) (string, error) {
-	if strings.HasPrefix(entry, "magnet:?") || strings.HasPrefix(entry, "ed2k://") { return entry, nil }
+	if isDirectLink(entry) { return entry, nil }
 	if !fanhaoPattern.MatchString(entry) { return "", errors.New("无法识别的格式") }
 	return b.searchMagnet(ctx, entry)
 }
@@ -415,6 +462,126 @@ func (b *Bot) searchMagnet(ctx context.Context, code string) (string, error) {
 	for _, entry := range unique { all = append(all, entry) }
 	sort.SliceStable(all, func(i, j int) bool { return b.entryBetter(all[i], all[j]) })
 	return all[0].Magnet, nil
+}
+
+func (b *Bot) startMukakuSearch(ctx context.Context, message *TelegramMessage, query string) {
+	if query == "" { return }
+	status := b.sendMessage(ctx, message.Chat.ID, "🔍 正在搜索 Mukaku，请稍候……")
+	go func() {
+		movies, err := b.mukakuSearch(ctx, query)
+		if err != nil {
+			log.Printf("Mukaku search failed for %q: %v", query, err)
+			b.editMessage(ctx, message.Chat.ID, status, "❌ 搜索失败，请稍后重试")
+			return
+		}
+		if len(movies) == 0 {
+			b.editMessage(ctx, message.Chat.ID, status, "❌ 未找到相关影视资源")
+			return
+		}
+		token := newMukakuToken()
+		session := &MukakuSession{Token: token, UserID: message.From.ID, Query: query, ExpiresAt: time.Now().Add(30 * time.Minute), Movies: movies, Resources: map[int][]MukakuResource{}, Added: map[string]bool{}}
+		b.mukakuMu.Lock()
+		if old := b.mukakuUser[message.From.ID]; old != "" { delete(b.mukakuByID, old) }
+		b.mukakuByID[token] = session
+		b.mukakuUser[message.From.ID] = token
+		b.mukakuMu.Unlock()
+		keyboard := make([][]InlineKeyboardButton, 0, len(movies))
+		for index, movie := range movies {
+			keyboard = append(keyboard, []InlineKeyboardButton{{Text: mukakuMovieLabel(movie), CallbackData: fmt.Sprintf("mk_movie_%s_%d", token, index)}})
+		}
+		b.editMessageWithMarkup(ctx, message.Chat.ID, status, fmt.Sprintf("🔎 Mukaku 搜索结果：%s\n请选择影视：", query), InlineKeyboardMarkup{InlineKeyboard: keyboard})
+	}()
+}
+
+func newMukakuToken() string {
+	data := make([]byte, 6)
+	if _, err := rand.Read(data); err == nil { return fmt.Sprintf("%x", data) }
+	return fmt.Sprintf("%x", time.Now().UnixNano())[:12]
+}
+
+func mukakuMovieLabel(movie MukakuMovie) string {
+	label := movie.Title
+	if movie.Year != "" { label += " (" + movie.Year + ")" }
+	return limitText(label, 55)
+}
+
+func (b *Bot) mukakuSearch(ctx context.Context, query string) ([]MukakuMovie, error) {
+	endpoint, err := url.Parse(b.cfg.MukakuBaseURL + "/prod/api/v1/getVideoList")
+	if err != nil { return nil, err }
+	params := endpoint.Query()
+	params.Set("app_id", b.cfg.MukakuAppID)
+	params.Set("identity", b.cfg.MukakuIdentity)
+	params.Set("sb", query)
+	params.Set("page", "1")
+	params.Set("limit", "10")
+	if b.cfg.MukakuToken != "" { params.Set("access_token", b.cfg.MukakuToken) }
+	endpoint.RawQuery = params.Encode()
+	var response struct {
+		Success bool `json:"success"`
+		Message string `json:"message"`
+		Data struct {
+			Data []MukakuMovie `json:"data"`
+		} `json:"data"`
+	}
+	if err := b.requestJSONRetry(ctx, http.MethodGet, endpoint.String(), nil, &response, 20*time.Second, 2); err != nil { return nil, err }
+	if !response.Success { return nil, errors.New(response.Message) }
+	if len(response.Data.Data) > 10 { response.Data.Data = response.Data.Data[:10] }
+	return response.Data.Data, nil
+}
+
+func (b *Bot) mukakuResources(ctx context.Context, movieID int64) ([]MukakuResource, error) {
+	endpoint, err := url.Parse(b.cfg.MukakuBaseURL + "/prod/api/v1/getTrDetail")
+	if err != nil { return nil, err }
+	params := endpoint.Query()
+	params.Set("app_id", b.cfg.MukakuAppID)
+	params.Set("identity", b.cfg.MukakuIdentity)
+	params.Set("id", strconv.FormatInt(movieID, 10))
+	if b.cfg.MukakuToken != "" { params.Set("access_token", b.cfg.MukakuToken) }
+	endpoint.RawQuery = params.Encode()
+	var response struct {
+		Success bool `json:"success"`
+		Message string `json:"message"`
+		Data struct {
+			ID     int64 `json:"id"`
+			Zname  string `json:"zname"`
+			Zsize  string `json:"zsizea"`
+			Zlink  string `json:"zlink"`
+			Arrare []struct {
+				ID     int64  `json:"id"`
+				Zname  string `json:"zname"`
+				Zsize  string `json:"zsize"`
+				Date   string `json:"eztime"`
+				Zlink  string `json:"zlink"`
+			} `json:"arrare"`
+		} `json:"data"`
+	}
+	if err := b.requestJSONRetry(ctx, http.MethodGet, endpoint.String(), nil, &response, 20*time.Second, 2); err != nil { return nil, err }
+	if !response.Success { return nil, errors.New(response.Message) }
+	resources := make([]MukakuResource, 0, len(response.Data.Arrare)+1)
+	if strings.HasPrefix(response.Data.Zlink, "magnet:?") { resources = append(resources, MukakuResource{ID: response.Data.ID, Name: response.Data.Zname, Size: response.Data.Zsize, Magnet: response.Data.Zlink}) }
+	for _, item := range response.Data.Arrare {
+		if strings.HasPrefix(item.Zlink, "magnet:?") { resources = append(resources, MukakuResource{ID: item.ID, Name: item.Zname, Size: item.Zsize, Date: item.Date, Magnet: item.Zlink}) }
+	}
+	if len(resources) > 10 { resources = resources[:10] }
+	return resources, nil
+}
+
+func (b *Bot) getMukakuSession(token string, userID int64) (*MukakuSession, bool) {
+	b.mukakuMu.Lock()
+	defer b.mukakuMu.Unlock()
+	session, ok := b.mukakuByID[token]
+	if !ok || session.UserID != userID || time.Now().After(session.ExpiresAt) { return nil, false }
+	return session, true
+}
+
+func limitText(value string, max int) string {
+	runes := []rune(value)
+	if len(runes) <= max { return value }
+	return string(runes[:max-1]) + "…"
+}
+
+func isDirectLink(entry string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(entry)), "magnet:?") || strings.HasPrefix(strings.ToLower(strings.TrimSpace(entry)), "ed2k://")
 }
 
 func (b *Bot) fetchSearchAPI(ctx context.Context, base, code string) []SearchEntry {
@@ -526,6 +693,7 @@ func (b *Bot) requestJSON(ctx context.Context, method, endpoint string, payload 
 	request.Header.Set("User-Agent", "tgbot-go/1.0")
 	if payload != nil { request.Header.Set("Content-Type", "application/json") }
 	if strings.Contains(endpoint, b.cfg.AlistBaseURL) { request.Header.Set("Authorization", b.cfg.AlistToken) }
+	if b.cfg.MukakuToken != "" && strings.Contains(endpoint, b.cfg.MukakuBaseURL) { request.Header.Set("Authorization", "Bearer "+b.cfg.MukakuToken) }
 	response, err := b.do(request); if err != nil { return err }
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -566,9 +734,15 @@ func (b *Bot) sendMessageWithMarkup(ctx context.Context, chatID int64, text stri
 }
 
 func (b *Bot) editMessage(ctx context.Context, chatID, messageID int64, text string) {
+	b.editMessageWithMarkup(ctx, chatID, messageID, text, InlineKeyboardMarkup{})
+}
+
+func (b *Bot) editMessageWithMarkup(ctx context.Context, chatID, messageID int64, text string, markup InlineKeyboardMarkup) {
 	if messageID == 0 { return }
 	var result struct { OK bool `json:"ok"` }
-	if err := b.telegramRequest(ctx, "editMessageText", map[string]interface{}{"chat_id": chatID, "message_id": messageID, "text": text}, &result, 20*time.Second); err != nil { log.Printf("edit message: %v", err) }
+	payload := map[string]interface{}{"chat_id": chatID, "message_id": messageID, "text": text}
+	if len(markup.InlineKeyboard) > 0 { payload["reply_markup"] = markup }
+	if err := b.telegramRequest(ctx, "editMessageText", payload, &result, 20*time.Second); err != nil { log.Printf("edit message: %v", err) }
 }
 
 func (b *Bot) answerCallback(ctx context.Context, id string) {
@@ -581,6 +755,8 @@ func (b *Bot) handleCallback(ctx context.Context, query *CallbackQuery) {
 	if !b.cfg.AllowedUsers[query.From.ID] { b.answerCallback(ctx, query.ID); return }
 	b.answerCallback(ctx, query.ID)
 	if query.Data == "help" { b.help(ctx, query.Message); return }
+	if strings.HasPrefix(query.Data, "mk_movie_") { b.handleMukakuMovie(ctx, query); return }
+	if strings.HasPrefix(query.Data, "mk_resource_") { b.handleMukakuResource(ctx, query); return }
 	if !strings.HasPrefix(query.Data, "setdir_") { return }
 	index, err := strconv.Atoi(strings.TrimPrefix(query.Data, "setdir_"))
 	if err != nil || index < 0 || index >= len(b.cfg.OfflineDirs) { b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ 无效目录"); return }
@@ -840,6 +1016,56 @@ func (b *Bot) cleanCommand(ctx context.Context, message *TelegramMessage, args [
 	renameCount := b.renameOfflineDirectories(ctx)
 	b.editMessage(ctx, message.Chat.ID, status, fmt.Sprintf("✅ 清理完成\n• 删除小文件: %d\n• 删除空目录: %d\n• 重命名文件夹: %d", deletedFiles, deletedDirs, renameCount))
 	b.refreshDirectory(ctx, message.Chat.ID, current)
+}
+
+func (b *Bot) handleMukakuMovie(ctx context.Context, query *CallbackQuery) {
+	parts := strings.Split(query.Data, "_")
+	if len(parts) != 4 { b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ 搜索结果已失效"); return }
+	index, err := strconv.Atoi(parts[3])
+	session, ok := b.getMukakuSession(parts[2], query.From.ID)
+	if err != nil || !ok || index < 0 || index >= len(session.Movies) { b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ 搜索结果已失效"); return }
+	resources, err := b.mukakuResources(ctx, session.Movies[index].ID)
+	if err != nil {
+		log.Printf("Mukaku detail failed for %q: %v", session.Movies[index].Title, err)
+		b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ 获取资源失败，请稍后重试")
+		return
+	}
+	if len(resources) == 0 { b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ 未找到可用磁力链接"); return }
+	b.mukakuMu.Lock()
+	session.Resources[index] = resources
+	b.mukakuMu.Unlock()
+	keyboard := make([][]InlineKeyboardButton, 0, len(resources))
+	for resourceIndex, resource := range resources {
+		label := resource.Name
+		if label == "" { label = "未命名资源" }
+		if resource.Size != "" { label += " · " + resource.Size }
+		keyboard = append(keyboard, []InlineKeyboardButton{{Text: limitText(label, 55), CallbackData: fmt.Sprintf("mk_resource_%s_%d_%d", session.Token, index, resourceIndex)}})
+	}
+	b.editMessageWithMarkup(ctx, query.Message.Chat.ID, query.Message.MessageID, fmt.Sprintf("🎬 %s\n请选择资源：", mukakuMovieLabel(session.Movies[index])), InlineKeyboardMarkup{InlineKeyboard: keyboard})
+}
+
+func (b *Bot) handleMukakuResource(ctx context.Context, query *CallbackQuery) {
+	parts := strings.Split(query.Data, "_")
+	if len(parts) != 5 { b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ 资源按钮已失效"); return }
+	movieIndex, movieErr := strconv.Atoi(parts[3])
+	resourceIndex, resourceErr := strconv.Atoi(parts[4])
+	session, ok := b.getMukakuSession(parts[2], query.From.ID)
+	if movieErr != nil || resourceErr != nil || !ok { b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ 资源按钮已失效"); return }
+	b.mukakuMu.Lock()
+	resources := session.Resources[movieIndex]
+	if movieIndex < 0 || movieIndex >= len(session.Movies) || resourceIndex < 0 || resourceIndex >= len(resources) { b.mukakuMu.Unlock(); b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ 资源按钮已失效"); return }
+	resource := resources[resourceIndex]
+	if session.Added[resource.Magnet] { b.mukakuMu.Unlock(); return }
+	b.mukakuMu.Unlock()
+	if _, err := b.addOfflineDownload(ctx, []string{resource.Magnet}); err != nil {
+		log.Printf("Mukaku add failed for %q: %v", resource.Name, err)
+		b.sendMessage(ctx, query.Message.Chat.ID, "❌ 添加失败，请稍后重试")
+		return
+	}
+	b.mukakuMu.Lock()
+	session.Added[resource.Magnet] = true
+	b.mukakuMu.Unlock()
+	b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "✅ 已添加到下载队列："+limitText(resource.Name, 120))
 }
 
 func (b *Bot) cleanSmallFiles(ctx context.Context, root string) int {

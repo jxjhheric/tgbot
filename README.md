@@ -15,6 +15,7 @@
 - `/notify` 控制任务和清理通知
 - `/reload_config` 热加载配置
 - HTTP/HTTPS 和 SOCKS5 代理
+- 非番号普通文本通过 Mukaku 搜索，并使用按钮选择影视和磁力资源
 - 定时清理、429 重试和状态持久化
 
 ## 文件结构
@@ -46,6 +47,10 @@ ALIST_TOKEN=你的AlistToken
 ALIST_OFFLINE_DIRS=/downloads
 JAV_SEARCH_APIS=https://example.com/api
 ALLOWED_USER_IDS=123456789
+MUKAKU_BASE_URL=https://web5.mukaku.com
+MUKAKU_APP_ID=83768d9ad4
+MUKAKU_IDENTITY=23734adac0301bccdcb107c4aa21f96c
+MUKAKU_ACCESS_TOKEN=
 ```
 
 常用可选变量：
@@ -72,6 +77,21 @@ STATE_FILE=/var/lib/tgbot/state.json
 4. `/etc/tgbot/tgbot.env`
 
 已经存在的系统环境变量优先级最高，不会被配置文件覆盖。
+
+### Mukaku 普通文本搜索
+
+发送非番号普通文本时，程序会调用 Mukaku 搜索并最多显示 10 个影视结果。点击影视按钮后才请求详情，最多显示 10 个磁力资源；点击资源按钮会直接添加到当前 Alist 目录。搜索结果只保存在内存 30 分钟，服务重启后旧按钮失效，同一用户的新搜索会覆盖旧搜索。
+
+Mukaku 默认使用公开接口配置：
+
+```dotenv
+MUKAKU_BASE_URL=https://web5.mukaku.com
+MUKAKU_APP_ID=83768d9ad4
+MUKAKU_IDENTITY=23734adac0301bccdcb107c4aa21f96c
+MUKAKU_ACCESS_TOKEN=
+```
+
+`MUKAKU_ACCESS_TOKEN` 通常可以留空；如果站点要求登录，再填写登录 token。番号、`magnet:?` 和 `ed2k://` 仍走原有流程；普通文本不会自动添加，必须通过按钮选择。
 
 清理功能还会在删除小文件和空目录后，检查每个 `ALIST_OFFLINE_DIRS` 目录的直属子文件夹。如果文件夹名称以一个或多个完整的 `【...】` 前缀开头，会删除这些前缀并保留后面的名称。例如 `【高清影视之家发布 www.HDBTHD.com】美国内战...` 会改为 `美国内战...`。该功能不递归处理更深层目录，不修改 `ALIST_OFFLINE_DIRS` 本身；如果新名称已存在，则跳过改名。
 
