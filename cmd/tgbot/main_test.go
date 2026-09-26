@@ -43,3 +43,22 @@ func TestMukakuResourceLabel(t *testing.T) {
 		})
 	}
 }
+
+func TestSeedhubParsing(t *testing.T) {
+	searchHTML := []byte(`<a href="/movies/137018/"><img alt="欢迎来龙餐馆" src="cover.webp"></a>`)
+	movies := parseSeedhubMovies(searchHTML, "https://www.seedhub.cc")
+	if len(movies) != 1 || movies[0].Title != "欢迎来龙餐馆" {
+		t.Fatalf("parseSeedhubMovies() = %#v", movies)
+	}
+
+	resourceHTML := []byte(`<a href="/link_start/?seed_id=753181&movie_title=test">[BiT吧] 欢迎来龙餐馆 1080P</a>`)
+	resources := parseSeedhubResourceEntries(resourceHTML, "https://www.seedhub.cc")
+	if len(resources) != 1 || resources[0].ID != 753181 {
+		t.Fatalf("parseSeedhubResourceEntries() = %#v", resources)
+	}
+
+	magnet := extractMagnet([]byte(`<div>magnet:?xt=urn:btih:ABC123&dn=welcome</div>`))
+	if magnet != "magnet:?xt=urn:btih:ABC123&dn=welcome" {
+		t.Fatalf("extractMagnet() = %q", magnet)
+	}
+}

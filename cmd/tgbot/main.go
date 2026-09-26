@@ -56,6 +56,7 @@ type Config struct {
 	MukakuAppID     string
 	MukakuIdentity  string
 	MukakuToken     string
+	SeedhubBaseURLs []string
 }
 
 type Category struct {
@@ -84,6 +85,8 @@ type Bot struct {
 	mukakuMu   sync.Mutex
 	mukakuByID map[string]*MukakuSession
 	mukakuUser map[int64]string
+	seedhubByID map[string]*SeedhubSession
+	seedhubUser map[int64]string
 }
 
 type TelegramUpdate struct {
@@ -176,6 +179,30 @@ type MukakuSession struct {
 	Added     map[string]bool
 }
 
+type SeedhubMovie struct {
+	ID         int64
+	Title      string
+	DetailURL  string
+}
+
+type SeedhubResource struct {
+	ID       int64
+	Name     string
+	EntryURL string
+	Magnet   string
+}
+
+type SeedhubSession struct {
+	Token     string
+	UserID    int64
+	Query     string
+	BaseURL   string
+	ExpiresAt time.Time
+	Movies    []SeedhubMovie
+	Resources map[int][]SeedhubResource
+	Added     map[string]bool
+}
+
 func main() {
 	if envFile := loadDotEnv(); envFile != "" {
 		log.Printf("loaded environment file: %s", envFile)
@@ -188,7 +215,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	bot := &Bot{cfg: cfg, client: client, cleanWake: make(chan struct{}, 1), apiSem: make(chan struct{}, cfg.MaxConcurrent), mukakuByID: map[string]*MukakuSession{}, mukakuUser: map[int64]string{}}
+	bot := &Bot{cfg: cfg, client: client, cleanWake: make(chan struct{}, 1), apiSem: make(chan struct{}, cfg.MaxConcurrent), mukakuByID: map[string]*MukakuSession{}, mukakuUser: map[int64]string{}, seedhubByID: map[string]*SeedhubSession{}, seedhubUser: map[int64]string{}}
 	if err := bot.loadState(); err != nil {
 		log.Printf("state load warning: %v", err)
 	}
@@ -277,6 +304,7 @@ func loadConfig() (Config, error) {
 		MukakuAppID:      envString("MUKAKU_APP_ID", "83768d9ad4"),
 		MukakuIdentity:   envString("MUKAKU_IDENTITY", "23734adac0301bccdcb107c4aa21f96c"),
 		MukakuToken:      strings.TrimSpace(os.Getenv("MUKAKU_ACCESS_TOKEN")),
+		SeedhubBaseURLs:  seedhubBaseURLs(),
 		CleanBatchSize:   envInt("CLEAN_BATCH_SIZE", 500),
 		MaxConcurrent:    envInt("MAX_CONCURRENT_REQUESTS", 20),
 		StateFile:        envString("STATE_FILE", defaultStateFile),
@@ -380,6 +408,7 @@ func (b *Bot) handleCommand(ctx context.Context, message *TelegramMessage, text 
 	case "/classify": b.classify(ctx, message, args)
 	case "/reload_config": b.reloadConfig(ctx, message)
 	case "/notify": b.notify(ctx, message, args)
+	case "/seedhub": b.seedhubCommand(ctx, message, args)
 	default: b.sendMessage(ctx, message.Chat.ID, "未知命令，请发送 /help 查看帮助。")
 	}
 }
@@ -399,8 +428,18 @@ func (b *Bot) help(ctx context.Context, message *TelegramMessage) {
 		"/classify [all|folder|file] 整理目录\n" +
 		"/refresh 刷新 Alist\n" +
 		"/notify 任务|清理 on|off 设置通知\n" +
+		"/seedhub <关键词> 搜索 SeedHub 磁力资源\n" +
 		"/reload_config 重新加载配置\n\n当前目录：" + current
 	b.sendMessage(ctx, message.Chat.ID, text)
+}
+
+func (b *Bot) seedhubCommand(ctx context.Context, message *TelegramMessage, args []string) {
+	query := strings.TrimSpace(strings.Join(args, " "))
+	if query == "" {
+		b.sendMessage(ctx, message.Chat.ID, "格式：/seedhub <关键词>\n例如：/seedhub 欢迎来龙餐馆")
+		return
+	}
+	b.startSeedhubSearch(ctx, message, query)
 }
 
 func (b *Bot) handleSingle(ctx context.Context, message *TelegramMessage, entry string) {
@@ -494,6 +533,193 @@ func (b *Bot) startMukakuSearch(ctx context.Context, message *TelegramMessage, q
 		}
 		b.editMessageWithMarkup(ctx, message.Chat.ID, status, fmt.Sprintf("🔎 Mukaku 搜索结果：%s\n请选择影视：", query), InlineKeyboardMarkup{InlineKeyboard: keyboard})
 	}()
+}
+
+func (b *Bot) startSeedhubSearch(ctx context.Context, message *TelegramMessage, query string) {
+	if query == "" { return }
+	status := b.sendMessage(ctx, message.Chat.ID, "🔍 正在搜索 SeedHub，请稍候……")
+	go func() {
+		movies, baseURL, err := b.seedhubSearch(ctx, query)
+		if err != nil {
+			log.Printf("SeedHub search failed for %q: %v", query, err)
+			b.editMessage(ctx, message.Chat.ID, status, "❌ SeedHub 搜索失败："+short(err.Error()))
+			return
+		}
+		if len(movies) == 0 {
+			b.editMessage(ctx, message.Chat.ID, status, "❌ SeedHub 未找到相关影视资源")
+			return
+		}
+		token := newMukakuToken()
+		session := &SeedhubSession{Token: token, UserID: message.From.ID, Query: query, BaseURL: baseURL, ExpiresAt: time.Now().Add(30 * time.Minute), Movies: movies, Resources: map[int][]SeedhubResource{}, Added: map[string]bool{}}
+		b.mukakuMu.Lock()
+		if old := b.seedhubUser[message.From.ID]; old != "" { delete(b.seedhubByID, old) }
+		b.seedhubByID[token] = session
+		b.seedhubUser[message.From.ID] = token
+		b.mukakuMu.Unlock()
+		keyboard := make([][]InlineKeyboardButton, 0, len(movies))
+		for index, movie := range movies {
+			keyboard = append(keyboard, []InlineKeyboardButton{{Text: limitText(movie.Title, 55), CallbackData: fmt.Sprintf("sh_movie_%s_%d", token, index)}})
+		}
+		b.editMessageWithMarkup(ctx, message.Chat.ID, status, fmt.Sprintf("🔎 SeedHub 搜索结果：%s\n来源：%s\n请选择影视：", query, baseURL), InlineKeyboardMarkup{InlineKeyboard: keyboard})
+	}()
+}
+
+func seedhubBaseURLs() []string {
+	configured := splitCSV(os.Getenv("SEEDHUB_BASE_URLS"))
+	if len(configured) == 0 {
+		configured = []string{"https://www.seedhub.cc", "https://sidhub.cc", "https://seedog.cc", "https://seeduck.cc", "https://hubdog.cc"}
+	}
+	result := make([]string, 0, len(configured))
+	seen := make(map[string]bool)
+	for _, value := range configured {
+		value = strings.TrimRight(strings.TrimSpace(value), "/")
+		if value == "" || seen[value] { continue }
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
+}
+
+func (b *Bot) seedhubSearch(ctx context.Context, query string) ([]SeedhubMovie, string, error) {
+	var lastErr error
+	for _, baseURL := range b.cfg.SeedhubBaseURLs {
+		endpoint := strings.TrimRight(baseURL, "/") + "/s/" + url.PathEscape(query) + "/"
+		body, err := b.fetchHTML(ctx, endpoint, 20*time.Second)
+		if err != nil { lastErr = err; continue }
+		movies := parseSeedhubMovies(body, baseURL)
+		if len(movies) > 0 { if len(movies) > 10 { movies = movies[:10] }; return movies, baseURL, nil }
+		lastErr = errors.New("页面没有可识别的搜索结果")
+	}
+	if lastErr == nil { lastErr = errors.New("没有可用的 SeedHub 地址") }
+	return nil, "", lastErr
+}
+
+func (b *Bot) seedhubResources(ctx context.Context, movie SeedhubMovie, baseURL string) ([]SeedhubResource, error) {
+	var lastErr error
+	for _, candidateBase := range b.seedhubCandidateBases(baseURL) {
+		detailURL := seedhubURLForBase(movie.DetailURL, candidateBase)
+		body, err := b.fetchHTML(ctx, detailURL, 20*time.Second)
+		if err != nil { lastErr = err; continue }
+		entries := parseSeedhubResourceEntries(body, candidateBase)
+		if len(entries) == 0 { lastErr = errors.New("详情页没有可识别的磁力资源"); continue }
+		resources := make([]SeedhubResource, 0, len(entries))
+		for _, entry := range entries {
+			resourceBody, fetchErr := b.fetchHTML(ctx, entry.EntryURL, 20*time.Second)
+			if fetchErr != nil { lastErr = fetchErr; continue }
+			magnet := extractMagnet(resourceBody)
+			if magnet == "" { lastErr = errors.New("资源页没有可识别的磁力链接"); continue }
+			entry.Magnet = magnet
+			resources = append(resources, entry)
+			if len(resources) >= 10 { break }
+		}
+		if len(resources) > 0 { return resources, nil }
+	}
+	if lastErr == nil { lastErr = errors.New("没有可用的 SeedHub 资源页") }
+	return nil, lastErr
+}
+
+func (b *Bot) seedhubCandidateBases(preferred string) []string {
+	result := make([]string, 0, len(b.cfg.SeedhubBaseURLs))
+	seen := make(map[string]bool)
+	for _, base := range append([]string{preferred}, b.cfg.SeedhubBaseURLs...) {
+		base = strings.TrimRight(strings.TrimSpace(base), "/")
+		if base == "" || seen[base] { continue }
+		seen[base] = true
+		result = append(result, base)
+	}
+	return result
+}
+
+func (b *Bot) fetchHTML(ctx context.Context, endpoint string, timeout time.Duration) ([]byte, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
+	if err != nil { return nil, err }
+	request.Header.Set("Accept", "text/html,application/xhtml+xml")
+	request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	response, err := b.do(request)
+	if err != nil { return nil, err }
+	defer response.Body.Close()
+	data, readErr := io.ReadAll(response.Body)
+	if readErr != nil { return nil, readErr }
+	if response.StatusCode < 200 || response.StatusCode >= 300 { return nil, fmt.Errorf("HTTP %d", response.StatusCode) }
+	if bytes.Contains(bytes.ToLower(data), []byte("just a moment")) || bytes.Contains(bytes.ToLower(data), []byte("enable javascript and cookies")) { return nil, errors.New("Cloudflare challenge") }
+	return data, nil
+}
+
+func parseSeedhubMovies(data []byte, baseURL string) []SeedhubMovie {
+	pattern := regexp.MustCompile(`(?is)<a[^>]+href=["']([^"']*/movies/[0-9]+/)["'][^>]*[^>]*>(.*?)</a>`)
+	altPattern := regexp.MustCompile(`(?is)<img[^>]+alt=["']([^"']+)["']`)
+	seen := make(map[string]bool)
+	result := make([]SeedhubMovie, 0)
+	for _, match := range pattern.FindAllSubmatch(data, -1) {
+		if len(match) < 3 { continue }
+		detailURL := absoluteSeedhubURL(baseURL, html.UnescapeString(string(match[1])))
+		title := strings.TrimSpace(stripTags(html.UnescapeString(string(match[2]))))
+		title = strings.TrimSpace(strings.TrimPrefix(title, "#"))
+		if title == "" {
+			if alt := altPattern.FindStringSubmatch(string(match[2])); len(alt) > 1 { title = strings.TrimSpace(html.UnescapeString(alt[1])) }
+		}
+		if title == "" || seen[detailURL] { continue }
+		seen[detailURL] = true
+		result = append(result, SeedhubMovie{ID: parseSeedhubID(detailURL), Title: title, DetailURL: detailURL})
+	}
+	return result
+}
+
+func parseSeedhubResourceEntries(data []byte, baseURL string) []SeedhubResource {
+	pattern := regexp.MustCompile(`(?is)<a[^>]+href=["']([^"']*link_start/\?[^"']*seed_id=[0-9]+[^"']*)["'][^>]*>(.*?)</a>`)
+	seen := make(map[string]bool)
+	result := make([]SeedhubResource, 0)
+	for _, match := range pattern.FindAllSubmatch(data, -1) {
+		if len(match) < 3 { continue }
+		entryURL := absoluteSeedhubURL(baseURL, html.UnescapeString(string(match[1])))
+		if seen[entryURL] { continue }
+		name := strings.TrimSpace(stripTags(html.UnescapeString(string(match[2]))))
+		if name == "" { name = "SeedHub 磁力资源" }
+		seen[entryURL] = true
+		result = append(result, SeedhubResource{ID: parseSeedhubIDFromQuery(entryURL, "seed_id"), Name: name, EntryURL: entryURL})
+	}
+	return result
+}
+
+func extractMagnet(data []byte) string {
+	match := regexp.MustCompile(`(?is)magnet:\?[^\s"'<>]+`).FindString(string(data))
+	if match == "" { return "" }
+	return html.UnescapeString(match)
+}
+
+func absoluteSeedhubURL(baseURL, value string) string {
+	parsed, err := url.Parse(value)
+	if err != nil { return value }
+	if parsed.IsAbs() { return parsed.String() }
+	base, err := url.Parse(strings.TrimRight(baseURL, "/") + "/")
+	if err != nil { return value }
+	return base.ResolveReference(parsed).String()
+}
+
+func seedhubURLForBase(endpoint, baseURL string) string {
+	parsed, err := url.Parse(endpoint)
+	if err != nil { return endpoint }
+	base, err := url.Parse(strings.TrimRight(baseURL, "/"))
+	if err != nil { return endpoint }
+	parsed.Scheme = base.Scheme
+	parsed.Host = base.Host
+	return parsed.String()
+}
+
+func parseSeedhubID(detailURL string) int64 { return parseSeedhubIDFromPath(detailURL) }
+
+func parseSeedhubIDFromPath(value string) int64 {
+	match := regexp.MustCompile(`/movies/([0-9]+)/`).FindStringSubmatch(value)
+	if len(match) != 2 { return 0 }
+	return int64(parseIntValue(match[1]))
+}
+
+func parseSeedhubIDFromQuery(value, key string) int64 {
+	parsed, err := url.Parse(value)
+	if err != nil { return 0 }
+	return int64(parseIntValue(parsed.Query().Get(key)))
 }
 
 func newMukakuToken() string {
@@ -789,6 +1015,8 @@ func (b *Bot) handleCallback(ctx context.Context, query *CallbackQuery) {
 	if query.Data == "help" { b.help(ctx, query.Message); return }
 	if strings.HasPrefix(query.Data, "mk_movie_") { b.handleMukakuMovie(ctx, query); return }
 	if strings.HasPrefix(query.Data, "mk_resource_") { b.handleMukakuResource(ctx, query); return }
+	if strings.HasPrefix(query.Data, "sh_movie_") { b.handleSeedhubMovie(ctx, query); return }
+	if strings.HasPrefix(query.Data, "sh_resource_") { b.handleSeedhubResource(ctx, query); return }
 	if !strings.HasPrefix(query.Data, "setdir_") { return }
 	index, err := strconv.Atoi(strings.TrimPrefix(query.Data, "setdir_"))
 	if err != nil || index < 0 || index >= len(b.cfg.OfflineDirs) { b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ 无效目录"); return }
@@ -1097,6 +1325,61 @@ func (b *Bot) handleMukakuResource(ctx context.Context, query *CallbackQuery) {
 	session.Added[resource.Magnet] = true
 	b.mukakuMu.Unlock()
 	b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "✅ 已添加到下载队列："+mukakuResourceLabel(resource))
+}
+
+func (b *Bot) getSeedhubSession(token string, userID int64) (*SeedhubSession, bool) {
+	b.mukakuMu.Lock()
+	defer b.mukakuMu.Unlock()
+	session, ok := b.seedhubByID[token]
+	if !ok || session.UserID != userID || time.Now().After(session.ExpiresAt) { return nil, false }
+	return session, true
+}
+
+func (b *Bot) handleSeedhubMovie(ctx context.Context, query *CallbackQuery) {
+	parts := strings.Split(query.Data, "_")
+	if len(parts) != 4 { b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ SeedHub 搜索结果已失效"); return }
+	index, err := strconv.Atoi(parts[3])
+	session, ok := b.getSeedhubSession(parts[2], query.From.ID)
+	if err != nil || !ok || index < 0 || index >= len(session.Movies) { b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ SeedHub 搜索结果已失效"); return }
+	resources, err := b.seedhubResources(ctx, session.Movies[index], session.BaseURL)
+	if err != nil {
+		log.Printf("SeedHub resource failed for %q: %v", session.Movies[index].Title, err)
+		b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ 获取 SeedHub 磁力失败："+short(err.Error()))
+		return
+	}
+	if len(resources) == 0 { b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ 未找到可用 SeedHub 磁力链接"); return }
+	b.mukakuMu.Lock()
+	session.Resources[index] = resources
+	b.mukakuMu.Unlock()
+	keyboard := make([][]InlineKeyboardButton, 0, len(resources))
+	for resourceIndex, resource := range resources {
+		keyboard = append(keyboard, []InlineKeyboardButton{{Text: limitText(resource.Name, 55), CallbackData: fmt.Sprintf("sh_resource_%s_%d_%d", session.Token, index, resourceIndex)}})
+	}
+	b.editMessageWithMarkup(ctx, query.Message.Chat.ID, query.Message.MessageID, fmt.Sprintf("🎬 %s\n请选择 SeedHub 磁力资源：", limitText(session.Movies[index].Title, 55)), InlineKeyboardMarkup{InlineKeyboard: keyboard})
+}
+
+func (b *Bot) handleSeedhubResource(ctx context.Context, query *CallbackQuery) {
+	parts := strings.Split(query.Data, "_")
+	if len(parts) != 5 { b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ SeedHub 资源按钮已失效"); return }
+	movieIndex, movieErr := strconv.Atoi(parts[3])
+	resourceIndex, resourceErr := strconv.Atoi(parts[4])
+	session, ok := b.getSeedhubSession(parts[2], query.From.ID)
+	if movieErr != nil || resourceErr != nil || !ok { b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ SeedHub 资源按钮已失效"); return }
+	b.mukakuMu.Lock()
+	resources := session.Resources[movieIndex]
+	if movieIndex < 0 || movieIndex >= len(session.Movies) || resourceIndex < 0 || resourceIndex >= len(resources) { b.mukakuMu.Unlock(); b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "❌ SeedHub 资源按钮已失效"); return }
+	resource := resources[resourceIndex]
+	if session.Added[resource.Magnet] { b.mukakuMu.Unlock(); return }
+	b.mukakuMu.Unlock()
+	if _, err := b.addOfflineDownload(ctx, []string{resource.Magnet}); err != nil {
+		log.Printf("SeedHub add failed for %q: %v", resource.Name, err)
+		b.sendMessage(ctx, query.Message.Chat.ID, "❌ SeedHub 磁力添加失败，请稍后重试")
+		return
+	}
+	b.mukakuMu.Lock()
+	session.Added[resource.Magnet] = true
+	b.mukakuMu.Unlock()
+	b.editMessage(ctx, query.Message.Chat.ID, query.Message.MessageID, "✅ 已添加到 AList 离线下载队列："+limitText(resource.Name, 55))
 }
 
 func (b *Bot) cleanSmallFiles(ctx context.Context, root string) int {
