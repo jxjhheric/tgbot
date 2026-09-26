@@ -635,8 +635,20 @@ func (b *Bot) fetchHTML(ctx context.Context, endpoint string, timeout time.Durat
 	defer cancel()
 	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
 	if err != nil { return nil, err }
-	request.Header.Set("Accept", "text/html,application/xhtml+xml")
 	request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+	request.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	request.Header.Set("Cache-Control", "no-cache")
+	request.Header.Set("Pragma", "no-cache")
+	request.Header.Set("Upgrade-Insecure-Requests", "1")
+	request.Header.Set("Sec-Fetch-Dest", "document")
+	request.Header.Set("Sec-Fetch-Mode", "navigate")
+	request.Header.Set("Sec-Fetch-Site", "none")
+	request.Header.Set("Sec-Fetch-User", "?1")
+	if parsed, parseErr := url.Parse(endpoint); parseErr == nil && parsed.Host != "" {
+		request.Header.Set("Referer", parsed.Scheme+"://"+parsed.Host+"/")
+		request.Header.Set("Origin", parsed.Scheme+"://"+parsed.Host)
+	}
 	response, err := b.do(request)
 	if err != nil { return nil, err }
 	defer response.Body.Close()
