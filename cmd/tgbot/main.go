@@ -444,7 +444,7 @@ func (b *Bot) seedhubCommand(ctx context.Context, message *TelegramMessage, args
 
 func (b *Bot) handleSingle(ctx context.Context, message *TelegramMessage, entry string) {
 	if !isDirectLink(entry) && !fanhaoPattern.MatchString(entry) {
-		b.startMukakuSearch(ctx, message, strings.TrimSpace(entry))
+		b.startSeedhubSearch(ctx, message, strings.TrimSpace(entry))
 		return
 	}
 	status := b.sendMessage(ctx, message.Chat.ID, "🔍 处理："+entry)
@@ -465,8 +465,8 @@ func (b *Bot) handleBatch(ctx context.Context, message *TelegramMessage, entries
 	success := 0
 	for index, entry := range entries {
 		if !isDirectLink(entry) && !fanhaoPattern.MatchString(entry) {
-			b.startMukakuSearch(ctx, message, strings.TrimSpace(entry))
-			results = append(results, fmt.Sprintf("%d. %s: 已发送 Mukaku 搜索", index+1, short(entry)))
+			b.startSeedhubSearch(ctx, message, strings.TrimSpace(entry))
+			results = append(results, fmt.Sprintf("%d. %s: 已发送 SeedHub 搜索", index+1, short(entry)))
 			continue
 		}
 		magnet, err := b.resolveEntry(ctx, entry)
